@@ -79,6 +79,14 @@ if (typeof t === "undefined") {
     "Preencha seu nome completo e RUC/C.I. para assinar.": "Complete su nombre completo y RUC/C.I. para firmar.",
     "Erro ao registrar assinatura:": "Error al registrar la firma:",
 
+    "Nenhuma mesa aberta na comanda.": "Ninguna mesa abierta en la comanda.",
+    "Esta mesa não tem itens.": "Esta mesa no tiene ítems.",
+    "Saldo financeiro do mensalista insuficiente.": "Saldo financiero del mensualista insuficiente.",
+    "Continuar mesmo assim?": "¿Continuar de todos modos?",
+    "Venda registrada!": "¡Venta registrada!",
+    "Só bebidas — direto ao balcão.": "Solo bebidas — directo al mostrador.",
+    "Enviado para a Cozinha!": "¡Enviado a la Cocina!",
+
     // Confirms
     "Remover a extensão de horário de hoje?": "¿Remover la extensión de horario de hoy?",
     "Deseja pausar este produto?": "¿Desea pausar este producto?",
@@ -125,6 +133,9 @@ if (typeof t === "undefined") {
   window.prompt = function(msg, defaultVal) {
     return origPrompt(translateText(msg), defaultVal);
   };
+  // Exposta para uso em outros lugares que mostram texto ao usuário
+  // fora de alert/confirm/prompt — ex.: o toast do PDV (_pdvToast).
+  window._translateText = translateText;
 })();
 
 
@@ -11409,6 +11420,7 @@ async function salvarPedidoBalcao() {
   atualizarCarrinhoPDV();
   atualizarBarraMesasAtivas();
   carregarMonitorMesas();
+  atualizarTextoBotaoPDV();
   // Toast não-bloqueante (alert segurava o popup de impressão)
   const _msgFinal = _soKg
     ? "✅ Venda registrada!"
@@ -11691,7 +11703,8 @@ async function finalizarPedidoMesaPDV() {
   carregarMonitorMesas();
   atualizarTextoBotaoPDV();
   if (typeof calcularFinanceiro === "function") calcularFinanceiro();
-  _pdvToast(`✅ Mesa ${mesa} finalizada!`);
+  const _langFinal = localStorage.getItem("admin_lang") || "es";
+  _pdvToast(_langFinal === "es" ? `✅ ¡Mesa ${mesa} finalizada!` : `✅ Mesa ${mesa} finalizada!`);
 }
 
 // ── Toast não-bloqueante do PDV ───────────────────────────────
@@ -11701,7 +11714,7 @@ function _pdvToast(msg, duracao = 3000) {
   t.id = "_pdv-toast";
   t.style.cssText =
     "position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#1a7a2e;color:#fff;padding:12px 28px;border-radius:30px;font-size:1rem;font-weight:700;z-index:999999;box-shadow:0 4px 20px rgba(0,0,0,0.25);pointer-events:none;animation:_toastIn 0.2s ease";
-  t.textContent = msg;
+  t.textContent = typeof window._translateText === "function" ? window._translateText(msg) : msg;
   if (!document.getElementById("_pdv-toast-style")) {
     const s = document.createElement("style");
     s.id = "_pdv-toast-style";
@@ -14716,13 +14729,21 @@ async function salvarEdicaoPedidoRelatorio() {
 function atualizarTextoBotaoPDV() {
   const btnText = document.getElementById('pdv-btn-text');
   const btnFinalizarMesa = document.getElementById('pdv-btn-finalizar-mesa');
+  const mesaVal = document.getElementById('balcao-mesa')?.value.trim() || '';
 
   if (window._mesaAbertaId) {
+    // Mesa já existente sendo editada: pode lançar itens novos OU finalizar
+    // (fechar a mesa de vez, escolhendo a forma de pagamento).
     if (btnText) btnText.textContent = t('pdv.lancar_pedido', 'Lançar Pedido');
-    // Com a mesa aberta, aparece um 2º botão para fechar a comanda de fato:
-    // escolhe a forma de pagamento e dá baixa no pedido inteiro.
     if (btnFinalizarMesa) btnFinalizarMesa.style.display = '';
+  } else if (mesaVal) {
+    // Número de mesa preenchido mas o pedido ainda nem existe no banco:
+    // é a abertura da mesa, então só envia para a cozinha — nada de
+    // "Finalizar a venda" aqui, pois ainda não é hora de cobrar.
+    if (btnText) btnText.textContent = t('pdv.lancar_pedido', 'Lançar Pedido');
+    if (btnFinalizarMesa) btnFinalizarMesa.style.display = 'none';
   } else {
+    // Venda avulta de balcão/retirada/delivery: fluxo de sempre.
     if (btnText) btnText.textContent = t('pdv.receber_finalizar', 'Receber e Finalizar');
     if (btnFinalizarMesa) btnFinalizarMesa.style.display = 'none';
   }
