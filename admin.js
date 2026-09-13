@@ -4823,36 +4823,38 @@ async function abrirModalProduto(produto = null, tipoInicial = null) {
       }
       // ── PIZZA: novo formato (tipos_pizza dinâmico) ──
       if (tipo === "pizza") {
-        const pizzaCfg = cfg.pizza || cfg; // suporta formato antigo (cfg.pizza) e novo (cfg direto)
-        // Tipos
+        const pizzaCfg = cfg.pizza || cfg;
+
+        // 1) Tipos primeiro
         const tiposPizza =
           cfg.tipos_pizza ||
           (cfg.pizza?.tipos || []).map((n) => ({ nome: n })) ||
           [];
         document.getElementById("pizza-tipos-lista").innerHTML = "";
         tiposPizza.forEach((t) => addPizzaTipo(t.nome));
-        if (tiposPizza.length === 0) {
-          // retrocompat: sem tipos definidos → cria Tradicional
-          addPizzaTipo("Tradicional");
-        }
-        // Bordas (novo: nome+preco; antigo: nome+tipo)
-        const bordas = (pizzaCfg.bordas || []).map(b => ({
+        if (tiposPizza.length === 0) addPizzaTipo("Tradicional");
+
+        // 2) Tamanhos — precisam existir ANTES das bordas,
+        //    porque addPizzaBorda() lê os nomes dos tamanhos do DOM.
+        (pizzaCfg.tamanhos || []).forEach((t) => addPizzaTamanho(t));
+
+        // 3) Bordas (agora enxergam os tamanhos corretamente)
+        const bordas = (pizzaCfg.bordas || []).map((b) => ({
           nome: b.nome,
           precos: b.precos || (b.preco ? { __legacy: b.preco } : {}),
         }));
         document.getElementById("pizza-tem-borda").checked = bordas.length > 0;
         document.getElementById("pizza-bordas-lista").innerHTML = "";
         toggleBordaPreco();
-        bordas.forEach(b => addPizzaBorda(b));
-        // Tamanhos
-        (pizzaCfg.tamanhos || []).forEach((t) => addPizzaTamanho(t));
-        // Sabores
+        bordas.forEach((b) => addPizzaBorda(b));
+
+        // 4) Sabores
         if (pizzaCfg.sabores && pizzaCfg.sabores.length > 0) {
           document.getElementById("pizza-sabores-lista").innerHTML = "";
           pizzaCfg.sabores.forEach((s) => addPizzaSabor(s));
-          // Drag já é vinculado dentro de addPizzaSabor
         }
       }
+
       // ── SHAKE ──
       if (tipo === "shake" && cfg.shake) {
         _popularShakeBuilder(cfg.shake);
@@ -5199,83 +5201,41 @@ function _pizzaTiposAtuais() {
 // Reconstrói as colunas de preço em todos os tamanhos quando tipos mudam
 function _pizzaRefreshTamanhoPrecos() {
   const tipos = _pizzaTiposAtuais();
+
+  // ⚠️ Não destrói os inputs se o usuário ainda está digitando o 1º tipo
+  // (evita que os inputs de preço sumam enquanto o nome está vazio).
+  if (tipos.length === 0) return;
+
   document.querySelectorAll(".pizza-tamanho-row").forEach((row) => {
     const box = row.querySelector(".pizza-tamanho-precos-dinamico");
     if (!box) return;
-    // Preserva valores existentes
-    const valoresExistentes = {};
-    box.querySelectorAll('[data-f="preco_tipo"]').forEach((inp) => {
-      if (inp.dataset.tipo) valoresExistentes[inp.dataset.tipo] = inp.value;
+
+    // ⚠️ CORRIGIDO: preserva por ÍNDICE (a posição não muda enquanto o
+    // usuário digita; só o nome muda). Era a causa dos preços sumirem.
+    const valoresPorIdx = [];
+    box.querySelectorAll('[data-f="preco_tipo"]').forEach((inp, idx) => {
+      valoresPorIdx[idx] = inp.value;
     });
+
     box.innerHTML = tipos
-      .map(
-        (t) => `
-      <div>
-        <label style="font-size:0.72rem;color:#555">💰 ${t} (Gs)</label>
-        <input data-f="preco_tipo" data-tipo="${t}" type="number" class="form-control"
-          value="${valoresExistentes[t] || ""}" placeholder="0" min="0" step="500">
-      </div>`,
-      )
+      .map((t, idx) => `
+        <div>
+          <label style="font-size:0.72rem;color:#555">💰 ${t} (Gs)</label>
+          <input data-f="preco_tipo" data-idx="${idx}" data-tipo="${t}"
+            type="number" class="form-control"
+            value="${valoresPorIdx[idx] || ""}" placeholder="0" min="0" step="500">
+        </div>`)
       .join("");
   });
+
   // Atualiza select de tipo nos sabores
   document.querySelectorAll(".pizza-sabor-tipo").forEach((sel) => {
     const val = sel.value;
     sel.innerHTML =
       tipos
-        .map(
-          (t) =>
-            `<option value="${t}" ${t === val ? "selected" : ""}>${t}</option>`,
-        )
+        .map((t) => `<option value="${t}" ${t === val ? "selected" : ""}>${t}</option>`)
         .join("") || '<option value="">— Tipo —</option>';
   });
-}
-
-function addPizzaBorda(dados = {}) {
-  const lista = document.getElementById("pizza-bordas-lista");
-  if (!lista) return;
-
-  // Tamanhos atualmente definidos na lista
-  const tamanhos = [...document.querySelectorAll(".pizza-tamanho-row")]
-    .map(r => r.querySelector('[data-f="nome"]')?.value?.trim())
-    .filter(Boolean);
-
-  // Compat: se veio do formato antigo {preco}, replica para todos
-  const precos = { ...(dados.precos || {}) };
-  if (dados.preco && !dados.precos) {
-    tamanhos.forEach(t => precos[t] = dados.preco);
-  }
-
-  const row = document.createElement("div");
-  row.className = "pizza-borda-row";
-  row.style.cssText = "background:#fff;border:1px solid #eee;border-radius:8px;padding:10px;margin-bottom:8px";
-
-  row.innerHTML = `
-    <div style="display:flex;gap:8px;align-items:flex-end;margin-bottom:8px">
-      <div style="flex:1">
-        <label style="font-size:0.72rem;color:#888">Nome da borda</label>
-        <input data-f="bnome" class="form-control" value="${dados.nome || ""}"
-          placeholder="Ex: Cheddar, Catupiry, Chocolate">
-      </div>
-      <button type="button" class="btn btn-sm btn-danger"
-        onclick="this.closest('.pizza-borda-row').remove()"
-        style="margin-bottom:2px">✕</button>
-    </div>
-    <div style="font-size:0.72rem;color:#888;font-weight:600;margin-bottom:6px">
-      💰 Preço por tamanho (Gs)
-    </div>
-    <div class="pizza-borda-precos-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(90px,1fr));gap:6px">
-      ${tamanhos.length === 0
-        ? '<div style="color:#c0392b;font-size:0.75rem;grid-column:1/-1">⚠️ Adicione tamanhos acima primeiro</div>'
-        : tamanhos.map(t => `
-          <div>
-            <label style="font-size:0.7rem;color:#666">${t}</label>
-            <input data-f="bpreco_tam" data-tam="${t}" type="number"
-              class="form-control" value="${precos[t] ?? ""}"
-              placeholder="0" min="0" step="500">
-          </div>`).join("")}
-    </div>`;
-  lista.appendChild(row);
 }
 
 // Chamar quando o nome de um tamanho mudar, para atualizar as colunas de preço
@@ -5303,6 +5263,47 @@ function _pizzaRefreshBordaTamanhos() {
   });
 }
 
+// Adiciona uma borda de pizza (nome + preço por tamanho)
+function addPizzaBorda(dados = {}) {
+  const lista = document.getElementById("pizza-bordas-lista");
+  if (!lista) return;
+
+  const tamanhos = [...document.querySelectorAll(".pizza-tamanho-row")]
+    .map((r) => r.querySelector('[data-f="nome"]')?.value?.trim())
+    .filter(Boolean);
+
+  const precos = dados.precos || {};
+
+  const row = document.createElement("div");
+  row.className = "pizza-borda-row";
+  row.style.cssText =
+    "border:1px solid #eee;border-radius:8px;padding:8px;margin-bottom:8px";
+  row.innerHTML = `
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
+      <input data-f="bnome" class="form-control" value="${dados.nome || ""}" placeholder="Ex: Catupiry, Cheddar" style="flex:1">
+      <button class="btn btn-sm btn-danger" onclick="this.closest('.pizza-borda-row').remove()">✕</button>
+    </div>
+    <div class="pizza-borda-precos-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(100px,1fr));gap:8px">
+      ${
+        tamanhos.length === 0
+          ? '<div style="color:#c0392b;font-size:0.75rem;grid-column:1/-1">⚠️ Adicione tamanhos acima primeiro</div>'
+          : tamanhos
+              .map(
+                (t) => `
+          <div>
+            <label style="font-size:0.7rem;color:#666">${t}</label>
+            <input data-f="bpreco_tam" data-tam="${t}" type="number"
+              class="form-control" value="${precos[t] ?? ""}"
+              placeholder="0" min="0" step="500">
+          </div>`,
+              )
+              .join("")
+      }
+    </div>
+  `;
+  lista.appendChild(row);
+}
+
 function addPizzaTamanho(dados = {}) {
   const lista = document.getElementById("pizza-tamanhos-lista");
   const row = document.createElement("div");
@@ -5318,11 +5319,11 @@ function addPizzaTamanho(dados = {}) {
 
   row.innerHTML = `
     <div class="pizza-tamanho-header" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin-bottom:8px">
-      <div style="flex:2;min-width:80px"><label style="font-size:0.72rem;color:#555">Nome</label><input data-f="nome" class="form-control" value="${dados.nome || ""}" placeholder="Ex: P, M, G, GG"></div>
+      <div style="flex:2;min-width:80px"><label style="font-size:0.72rem;color:#555">Nome</label><input data-f="nome" class="form-control" value="${dados.nome || ""}" placeholder="Ex: P, M, G, GG" oninput="_pizzaRefreshBordaTamanhos()"></div>
       <div style="flex:1;min-width:60px"><label style="font-size:0.72rem;color:#555">Fatias</label><input data-f="fatias" type="number" class="form-control" value="${dados.fatias || ""}" placeholder="8"></div>
       <div style="flex:1;min-width:60px"><label style="font-size:0.72rem;color:#555">Cm</label><input data-f="cm" type="number" class="form-control" value="${dados.cm || ""}" placeholder="35"></div>
       <div style="flex:1;min-width:70px"><label style="font-size:0.72rem;color:#555">Máx. sabores</label><input data-f="max_sabores" type="number" min="1" max="8" class="form-control" value="${dados.max_sabores || 2}"></div>
-      <button class="btn btn-sm btn-danger" onclick="this.closest('.pizza-tamanho-row').remove()" style="margin-bottom:2px">✕</button>
+       <button class="btn btn-sm btn-danger" onclick="this.closest('.pizza-tamanho-row').remove();_pizzaRefreshBordaTamanhos()" style="margin-bottom:2px">✕</button>
     </div>
     <div class="pizza-tamanho-precos-dinamico" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:8px">
       ${tipos
@@ -5338,6 +5339,7 @@ function addPizzaTamanho(dados = {}) {
     </div>
   `;
   lista.appendChild(row);
+  _pizzaRefreshBordaTamanhos();
 }
 
 function addPizzaSabor(dados = {}) {
@@ -9788,8 +9790,9 @@ function _pdvModalConfirmar(cacheKey) {
     const precostipos = saboresSel.map(s => _pdvPrecoPorTipo(tam, s.tipo));
     preco = precostipos.length > 0 ? Math.max(...precostipos) : (tam?.preco || preco);
 
-    const bordaPreco = borda
-      ? cfg.bordas?.find((b) => b.nome === borda)?.preco || 0
+    const bordaObjSel = borda ? cfg.bordas?.find((b) => b.nome === borda) : null;
+    const bordaPreco = bordaObjSel
+      ? (bordaObjSel.precos?.[tam?.nome] ?? bordaObjSel.preco ?? 0)
       : 0;
     preco += bordaPreco;
 

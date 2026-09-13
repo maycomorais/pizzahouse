@@ -1399,15 +1399,26 @@ function _atualizarResumo() {
 // ══════════════════════════════════════════════════════════
 function _precoPizzaPorTipo(tam, tipo) {
   if (!tam) return 0;
-  // tam.precos é o mapa tipo→preço salvo pelo admin
   const precos = tam.precos || {};
-  // Tenta exato primeiro, depois case-insensitive
+
+  // 1) Match exato
   if (tipo && precos[tipo] > 0) return precos[tipo];
+
+  // 2) Match case-insensitive
   if (tipo) {
-    const chave = Object.keys(precos).find(k => k.toLowerCase() === tipo.toLowerCase());
+    const chave = Object.keys(precos).find(
+      (k) => k.toLowerCase() === tipo.toLowerCase(),
+    );
     if (chave && precos[chave] > 0) return precos[chave];
   }
-  // Fallback: preco mínimo do tamanho
+
+  // 3) Fallback: se o tipo não bate com nenhum preço, usa o MAIOR preço
+  //    do tamanho (para não cobrar a menos se o sabor é premium) — não o
+  //    preco mínimo, que geraria "Gs 0" quando todos os tipos são nulos.
+  const vals = Object.values(precos).filter((v) => v > 0);
+  if (vals.length) return Math.max(...vals);
+
+  // 4) Último recurso: preço base do produto
   return tam.preco || 0;
 }
 
