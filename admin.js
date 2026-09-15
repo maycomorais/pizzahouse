@@ -409,90 +409,138 @@ document.addEventListener("DOMContentLoaded", async () => {
   );
 });
 
-// ========================================
-// IMGBB UPLOAD
-// ========================================
-const IMGBB_API_KEY = "d6ade30e77d706a440f7c03f08af33c4"; // Substitua pela sua chave
+// ═══════════════════════════════════════════════════════════════════════
+// UPLOAD DE IMAGENS — SUPABASE STORAGE + CONVERSÃO WEBP + LIMITE DE ALTURA
+// ═══════════════════════════════════════════════════════════════════════
+// Configurações (ajuste se quiser)
+const SUPABASE_STORAGE_BUCKET = "imagens"; // nome do bucket criado no Supabase
+const IMAGEM_MAX_ALTURA_PX    = 500;       // altura máxima da imagem final
+const IMAGEM_MAX_LARGURA_PX   = 2000;      // segurança: evita imagens gigantes de largura
+const IMAGEM_QUALIDADE_WEBP   = 82;        // 0-100 (82 = ótimo equilíbrio)
 
 /**
- * Faz upload de uma imagem para o ImgBB e retorna a URL direta.
- * @param {File} file - Arquivo de imagem
- * @param {number} quality - Qualidade WebP (0-100), padrão 80
- * @returns {Promise<string>} - URL da imagem
+ * Converte um File/Blob para WebP, redimensionando a imagem
+ * respeitando altura máxima (padrão 500px). Mantém proporção original.
+ * Se a imagem já for menor que o limite, mantém o tamanho original.
+ *
+ * @param {File|Blob} file
+ * @param {number} quality   Qualidade WebP 0-100
+ * @param {number} maxAltura Altura máxima em pixels
+ * @returns {Promise<Blob>}  Blob WebP pronto para upload
  */
-async function uploadImageToImgbb(file, quality = 80) {
-  // 1. Validações
-  const tiposPermitidos = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
-  if (!tiposPermitidos.includes(file.type)) {
-    throw new Error('Formato inválido. Use JPG, PNG, WEBP ou GIF.');
-  }
-  if (file.size > 10 * 1024 * 1024) {
-    throw new Error('Imagem muito grande. Máximo 10MB (limite do ImgBB).');
-  }
-
-  // 2. Converter para WebP (comprime e reduz tamanho)
-  const webpBlob = await convertToWebP(file, quality);
-
-  // 3. Enviar para ImgBB via API
-  const formData = new FormData();
-  formData.append('key', IMGBB_API_KEY);
-  formData.append('image', webpBlob, 'image.webp'); // Envia como Blob
-  formData.append('name', file.name.replace(/\.[^.]+$/, '.webp'));
-
-  const response = await fetch('https://api.imgbb.com/1/upload', {
-    method: 'POST',
-    body: formData,
-  });
-
-  const data = await response.json();
-  if (!data.success) {
-    throw new Error(`ImgBB: ${data.error?.message || 'Erro desconhecido'}`);
-  }
-
-  // Retorna a URL direta da imagem (display_url)
-  return data.data.url;
-}
-
-/**
- * Converte um File/Blob para WebP com qualidade ajustável, redimensionando
- * antes se a imagem for muito grande. Fotos de celular saem com 3000-4000px
- * de largura — sem esse limite, mesmo em WebP o arquivo final fica pesado
- * (às vezes vários MB) para uma imagem que no site aparece com ~130px.
- * Isso é a causa mais provável de imagens "lentas" no cardápio.
- */
-function convertToWebP(file, quality = 80, maxDimensao = 1280) {
+function convertToWebP(file, quality = IMAGEM_QUALIDADE_WEBP, maxAltura = IMAGEM_MAX_ALTURA_PX) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
+
     reader.onload = (e) => {
       const img = new Image();
+
       img.onload = () => {
         let { width, height } = img;
-        if (width > maxDimensao || height > maxDimensao) {
-          if (width >= height) {
-            height = Math.round((height * maxDimensao) / width);
-            width = maxDimensao;
-          } else {
-            width = Math.round((width * maxDimensao) / height);
-            height = maxDimensao;
-          }
+
+        // ── Aplica limite de ALTURA (prioritário) ─────────────────
+        if (height > maxAltura) {
+          const ratio = maxAltura / height;
+          width  = Math.round(width * ratio);
+          height = maxAltura;
         }
-        const canvas = document.createElement('canvas');
-        canvas.width = width;
+
+        // ── Segurança: se mesmo assim a largura ficou absurda, limita ──
+        if (width > IMAGEM_MAX_LARGURA_PX) {
+          const ratio = IMAGEM_MAX_LARGURA_PX / width;
+          width  = IMAGEM_MAX_LARGURA_PX;
+          height = Math.round(height * ratio);
+        }
+
+        const canvas = document.createElement("canvas");
+        canvas.width  = width;
         canvas.height = height;
-        const ctx = canvas.getContext('2d');
+        const ctx = canvas.getContext("2d");
+
+        // Qualidade alta pra reduzir artefatos
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = "high";
+
+        // Fundo branco (WebP com alpha funciona, mas alguns cards/OG não gostam)
+        // Remova as 2 linhas abaixo se quiser PRESERVAR transparência (PNG/GIF)
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, width, height);
+
         ctx.drawImage(img, 0, 0, width, height);
-        canvas.toBlob((blob) => {
-          if (blob) resolve(blob);
-          else reject(new Error('Falha na conversão para WebP'));
-        }, 'image/webp', quality / 100);
+
+        canvas.toBlob(
+          (blob) => {
+            if (blob) resolve(blob);
+            else reject(new Error("Falha na conversão para WebP"));
+          },
+          "image/webp",
+          quality / 100
+        );
       };
-      img.onerror = reject;
+
+      img.onerror = () => reject(new Error("Não foi possível ler a imagem"));
       img.src = e.target.result;
     };
-    reader.onerror = reject;
+
+    reader.onerror = () => reject(new Error("Falha ao ler o arquivo"));
     reader.readAsDataURL(file);
   });
 }
+
+/**
+ * Faz upload de uma imagem para o Supabase Storage,
+ * convertendo-a para WebP e limitando a altura a 500px.
+ *
+ * @param {File} file      Arquivo selecionado pelo usuário
+ * @param {number} quality Qualidade WebP (0-100). Padrão 82.
+ * @returns {Promise<string>} URL pública da imagem
+ */
+async function uploadImageToSupabase(file, quality = IMAGEM_QUALIDADE_WEBP) {
+  // ── 1. Validações ─────────────────────────────────────────────
+  const tiposPermitidos = ["image/jpeg", "image/png", "image/webp", "image/gif"];
+  if (!tiposPermitidos.includes(file.type)) {
+    throw new Error("Formato inválido. Use JPG, PNG, WEBP ou GIF.");
+  }
+  if (file.size > 10 * 1024 * 1024) {
+    throw new Error("Imagem muito grande. Máximo 10MB.");
+  }
+
+  // ── 2. Converte para WebP (com limite de altura) ─────────────
+  const webpBlob = await convertToWebP(file, quality, IMAGEM_MAX_ALTURA_PX);
+
+  // ── 3. Nome único do arquivo (evita sobrescrever) ────────────
+  const agora = new Date();
+  const pasta = `${agora.getFullYear()}/${String(agora.getMonth() + 1).padStart(2, "0")}`;
+  const rand  = Math.random().toString(36).slice(2, 8);
+  const nome  = `${pasta}/${Date.now()}_${rand}.webp`;
+
+  // ── 4. Upload para o Supabase Storage ────────────────────────
+  const { data, error } = await supa.storage
+    .from(SUPABASE_STORAGE_BUCKET)
+    .upload(nome, webpBlob, {
+      contentType:  "image/webp",
+      cacheControl: "31536000", // 1 ano de cache (navegador não vai rebaixar)
+      upsert:       false,
+    });
+
+  if (error) {
+    throw new Error(`Storage: ${error.message}`);
+  }
+
+  // ── 5. Retorna URL pública ───────────────────────────────────
+  const { data: urlData } = supa.storage
+    .from(SUPABASE_STORAGE_BUCKET)
+    .getPublicUrl(data.path);
+
+  return urlData.publicUrl;
+}
+
+// ── Compatibilidade retroativa ──────────────────────────────────
+// Mantém o nome antigo funcionando em TODAS as chamadas já existentes
+// no admin.js (salvarProduto, salvarBanner, uploadSaborImagem,
+// _uploadLogoIdentidade, salvarPersonalizacao) — sem precisar
+// alterar nenhuma delas.
+const uploadImageToImgbb = uploadImageToSupabase;
 
 // =========================================
 // 2. CONTROLE DE ABAS
@@ -9188,6 +9236,8 @@ function adicionarItemPDV(p) {
 
 // ── Modal unificado de opções para PDV ────────────────────────────
 // Cobre: variacoes, pizza, acai, shake, suco, sorvete, montavel
+// ── Modal unificado de opções para PDV ────────────────────────────
+// Cobre: variacoes, pizza, acai, shake, suco, sorvete, montavel
 function _mostrarModalOpcoesPDV(produto, tipo) {
   document.getElementById("pdv-opcoes-modal")?.remove();
 
@@ -9280,10 +9330,19 @@ function _mostrarModalOpcoesPDV(produto, tipo) {
       const vals = Object.values(tam.precos || {}).filter(v => v > 0);
       return vals.length ? Math.min(...vals) : (tam.preco || 0);
     };
+    // Retorna o preço da borda para um tamanho específico
+    const _pdvPrecoBorda = (borda, tam) => {
+      if (!borda) return 0;
+      const tamNome = tam?.nome;
+      if (borda.precos && tamNome && borda.precos[tamNome] != null) {
+        return borda.precos[tamNome];
+      }
+      return borda.preco || 0;
+    };
 
     let html = "";
 
-    // ── Passo 1: Tamanho (cards com fatias, cm e preço — igual ao app.js) ──
+    // ── Passo 1: Tamanho ───────────────────────────────────────
     if (tamanhos.length) {
       html += `<div style="margin-bottom:14px">
         <p style="font-size:0.82rem;font-weight:700;color:#e74c3c;margin-bottom:8px">📐 Tamanho:</p>
@@ -9301,7 +9360,7 @@ function _mostrarModalOpcoesPDV(produto, tipo) {
       </div>`;
     }
 
-    // ── Passo 2: Sabores — cada card mostra o preço do seu tipo (igual ao app.js) ──
+    // ── Passo 2: Sabores — cada card mostra o preço do seu tipo ──
     const maxSabDefault = tamanhos[0]?.max_sabores || 2;
     const tam0 = tamanhos[0];
     const precoMin0 = _pdvPrecoMin(tam0);
@@ -9311,9 +9370,10 @@ function _mostrarModalOpcoesPDV(produto, tipo) {
         ${sabores.map(s => {
           const precoEste0 = _pdvPrecoTipo(tam0, s.tipo);
           const diff0 = precoEste0 - precoMin0;
+          const spanId = "_pdv_sp_" + s.nome.replace(/[^a-zA-Z0-9]/g, '_');
           const precoLbl = diff0 > 0
-            ? `<span id="_pdv_sp_${s.nome.replace(/[^a-zA-Z0-9]/g,'_')}" style="font-size:0.78rem;font-weight:700;color:#e74c3c;white-space:nowrap">+Gs ${diff0.toLocaleString("es-PY")}</span>`
-            : `<span id="_pdv_sp_${s.nome.replace(/[^a-zA-Z0-9]/g,'_')}" style="font-size:0.78rem;font-weight:700;color:#e74c3c;white-space:nowrap"></span>`;
+            ? `<span id="${spanId}" style="font-size:0.78rem;font-weight:700;color:#e74c3c;white-space:nowrap">+Gs ${diff0.toLocaleString("es-PY")}</span>`
+            : `<span id="${spanId}" style="font-size:0.78rem;font-weight:700;color:#e74c3c;white-space:nowrap"></span>`;
           const tipoBadge = s.tipo
             ? `<span style="font-size:0.68rem;background:#fef3c7;color:#92400e;border-radius:4px;padding:1px 6px;margin-left:4px;font-weight:600">${s.tipo}</span>`
             : "";
@@ -9333,8 +9393,11 @@ function _mostrarModalOpcoesPDV(produto, tipo) {
       </div>
     </div>`;
 
-    // ── Passo 3: Borda (opcional) — com update de preço ──────────
+    // ── Passo 3: Borda (opcional) ───────────────────────────────
+    // Exibe já o preço correto do PRIMEIRO tamanho — depois é atualizado
+    // dinamicamente por _pdvPizzaAtualizarPreco() quando o tamanho muda.
     if (bordas.length) {
+      const tamInicial = tamanhos[0];
       html += `<div style="margin-bottom:14px">
         <p style="font-size:0.82rem;font-weight:700;color:#e74c3c;margin-bottom:8px">🧀 Borda (opcional):</p>
         <div style="display:flex;flex-wrap:wrap;gap:6px" id="_pdv_pizza_borda_grid">
@@ -9342,12 +9405,15 @@ function _mostrarModalOpcoesPDV(produto, tipo) {
             onclick="this.closest('#_pdv_pizza_borda_grid').querySelectorAll('label').forEach(l=>{l.style.borderColor='#e5e7eb';l.style.background=''});this.style.borderColor='#27ae60';this.style.background='#f0fff4';if(typeof _pdvPizzaAtualizarPreco==='function')_pdvPizzaAtualizarPreco()">
             <input type="radio" name="_pdv_pizza_borda" value="" style="display:none" checked> Sem borda
           </label>
-          ${bordas.map(b => `
+          ${bordas.map(b => {
+            const precoAtual = _pdvPrecoBorda(b, tamInicial);
+            return `
             <label style="border:2px solid #e5e7eb;border-radius:8px;padding:8px 12px;cursor:pointer;font-size:0.85rem;font-weight:600;transition:all .15s"
               onclick="this.closest('#_pdv_pizza_borda_grid').querySelectorAll('label').forEach(l=>{l.style.borderColor='#e5e7eb';l.style.background=''});this.style.borderColor='#27ae60';this.style.background='#f0fff4';if(typeof _pdvPizzaAtualizarPreco==='function')_pdvPizzaAtualizarPreco()">
               <input type="radio" name="_pdv_pizza_borda" value="${b.nome}" style="display:none">
-              ${b.nome}${b.preco ? ` <span style="color:#e74c3c">+Gs ${b.preco.toLocaleString("es-PY")}</span>` : ""}
-            </label>`).join("")}
+              ${b.nome}<span class="borda-preco-lbl" style="color:#e74c3c">${precoAtual > 0 ? ` +Gs ${precoAtual.toLocaleString("es-PY")}` : ""}</span>
+            </label>`;
+          }).join("")}
         </div>
       </div>`;
     }
@@ -9360,11 +9426,11 @@ function _mostrarModalOpcoesPDV(produto, tipo) {
 
     corpo().innerHTML = html;
 
-    // Expõe cfg para uso externo
+    // Expõe cfg para uso externo (compatibilidade)
     window._pdvPizzaCfg = cfg;
 
-    // ── _pdvPizzaAtualizarPreco: igual ao app.js ─────────────────
-    // Preço = max(tam.precos[tipo] para cada sabor selecionado) + borda
+    // ── Função que recalcula o preço toda vez que algo muda ────
+    // Aqui DENTRO do escopo, `tam`, `cfg`, `_pdvPrecoTipo` etc. são acessíveis.
     window._pdvPizzaAtualizarPreco = function () {
       const tamIdx = parseInt(
         modal.querySelector('input[name="_pdv_pizza_tam"]:checked')?.value ?? 0,
@@ -9376,54 +9442,55 @@ function _mostrarModalOpcoesPDV(produto, tipo) {
       const maxLbl = modal.querySelector("#_pdv_pizza_maxlabel");
       if (maxLbl) maxLbl.textContent = `(até ${tam.max_sabores || 2})`;
 
-      // Atualiza preço diferencial em cada card de sabor
+      // Atualiza o diferencial de preço em cada card de sabor
       const precoMin = _pdvPrecoMin(tam);
       modal.querySelectorAll("#_pdv_sabores_lista label").forEach(lbl => {
-        const tipo = lbl.dataset.tipoSabor || "";
-        const precoEste = _pdvPrecoTipo(tam, tipo);
+        const tSabor = lbl.dataset.tipoSabor || "";
+        const precoEste = _pdvPrecoTipo(tam, tSabor);
         const diff = precoEste - precoMin;
         const nomeSabor = (lbl.querySelector("input[type=checkbox]")?.value || "").replace(/[^a-zA-Z0-9]/g, "_");
         const el = modal.querySelector(`#_pdv_sp_${nomeSabor}`);
         if (el) el.textContent = diff > 0 ? `+Gs ${diff.toLocaleString("es-PY")}` : "";
       });
 
-      // Calcula preço: max dos tipos dos sabores selecionados (REGRA DE OURO — igual app.js)
+      // ── Calcula preço base ─────────────────────────────────────
+      // Regra: max entre os tipos dos sabores selecionados
       const saboresSel = [...modal.querySelectorAll("#_pdv_sabores_lista input[type=checkbox]:checked")]
         .map(c => c.closest("label")?.dataset.tipoSabor || "");
 
       let precoBase;
       if (saboresSel.length > 0) {
-        precoBase = Math.max(...saboresSel.map(tipo => _pdvPrecoTipo(tam, tipo)));
+        precoBase = Math.max(...saboresSel.map(tp => _pdvPrecoTipo(tam, tp)));
       } else {
         precoBase = tam.preco || 0;
       }
 
+      // ── Borda: preço do tamanho atual ──────────────────────────
       const bordaVal = modal.querySelector('input[name="_pdv_pizza_borda"]:checked')?.value || "";
-      const tamNome = tam?.nome;
-      const bordaObj = cfg.bordas?.find(b => b.nome === bordaVal);
-      const bordaPreco = bordaObj
-        ? (bordaObj.precos?.[tamNome] ?? bordaObj.preco ?? 0)
-        : 0;
+      const bordaObj = bordaVal ? cfg.bordas?.find(b => b.nome === bordaVal) : null;
+      const bordaPreco = bordaObj ? _pdvPrecoBorda(bordaObj, tam) : 0;
 
+      // Atualiza o preço exibido em cada chip de borda (agora tam existe!)
+      modal.querySelectorAll('#_pdv_pizza_borda_grid label').forEach(lbl => {
+        const radio = lbl.querySelector('input[name="_pdv_pizza_borda"]');
+        if (!radio || !radio.value) return;   // "Sem borda" — sem preço
+        const bObj = cfg.bordas?.find(b => b.nome === radio.value);
+        const p = _pdvPrecoBorda(bObj, tam);
+        const span = lbl.querySelector('.borda-preco-lbl');
+        if (span) span.textContent = p > 0 ? ` +Gs ${p.toLocaleString("es-PY")}` : "";
+      });
+
+      // ── Preço total exibido ────────────────────────────────────
       const el = modal.querySelector("#_pdv_pizza_preco_val");
       if (el) el.textContent = "Gs " + (precoBase + bordaPreco).toLocaleString("es-PY");
     };
 
-    // dentro de _pdvPizzaAtualizarPreco, após calcular tam:
-    modal.querySelectorAll('#_pdv_pizza_borda_grid label').forEach(lbl => {
-      const radio = lbl.querySelector('input[name="_pdv_pizza_borda"]');
-      if (!radio || !radio.value) return;  // "Sem borda"
-      const bObj = cfg.bordas?.find(b => b.nome === radio.value);
-      const preco = bObj?.precos?.[tam.nome] ?? bObj?.preco ?? 0;
-      const span = lbl.querySelector('.borda-preco-lbl');
-      if (span) span.textContent = preco > 0 ? `+Gs ${preco.toLocaleString("es-PY")}` : "";
-    });
-
-    // Compatibilidade — mantém função de filtro mas delegando para update de preço
+    // Compat — mantém o nome antigo funcionando
     window._pdvPizzaFiltrarSabores = function () {
       _pdvPizzaAtualizarPreco();
     };
 
+    // Calcula o preço uma vez na abertura
     _pdvPizzaAtualizarPreco();
   }
 
