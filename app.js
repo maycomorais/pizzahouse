@@ -177,16 +177,6 @@ async function confirmarEntregaCliente() {
   }
 }
 
-function _precoBordaPorTamanho(borda, tamanho) {
-  if (!borda) return 0;
-  const tamNome = tamanho?.nome;
-  if (borda.precos && tamNome && borda.precos[tamNome] != null) {
-    return borda.precos[tamNome];
-  }
-  // Compat: borda antiga com preço único
-  return borda.preco || 0;
-}
-
 // ===== MOSTRAR MENSAGEM DE CONFIRMAÇÃO =====
 function mostrarMensagemEntregaConfirmada() {
   const tracker = document.getElementById("pedido-tracker");
@@ -266,6 +256,8 @@ if (typeof supa === "undefined") {
 // ==========================================
 let carrinho = [];
 let FEATURES_PAGAMENTOS_CLIENTE = null; // features_ativas.pagamentos (controlado pelo adminMaster)
+let DELIVERY_ABERTO_CLIENTE = true;
+let AVISO_DELIVERY_CLIENTE  = "";
 let freteCalculado = 0;
 // Marca quando o frete foi resolvido via fallback (GPS falhou, aplicou
 // o mínimo da tabela) — usada na validação do checkout pra não travar
@@ -406,6 +398,9 @@ async function verificarHorario() {
     TABELA_FRETE = data.tabela_frete;
   if (data.limite_distancia_km != null)
     LIMITE_DISTANCIA_KM = parseFloat(data.limite_distancia_km) || null;
+
+   window.ZONAS_ESPECIAIS = Array.isArray(data.zonas_especiais) ? data.zonas_especiais : [];
+   
   // Aplica visibilidade das formas de pagamento conforme configuração
   FEATURES_PAGAMENTOS_CLIENTE = data.features_ativas?.pagamentos || null;
   _aplicarFormasPagamentoCliente(data.features_ativas);
@@ -420,6 +415,25 @@ async function verificarHorario() {
   if (data.alias_qr_url) QR_ALIAS_URL = data.alias_qr_url;
   if (data.qr_py_url) QR_PY_URL = data.qr_py_url;
   if (data.whatsapp_loja) WHATSAPP_LOJA_APP = data.whatsapp_loja;
+
+  // ── Delivery aberto/fechado + extensão de horário do dia ──────────
+  // Carregados ANTES do cálculo de aberto/fechado porque influenciam
+  // a decisão final de "aceita pedido agora?".
+  const _deliveryAberto = data.delivery_aberto !== false; // default true
+  const _avisoDelivery  = (data.aviso_delivery || "").trim();
+  DELIVERY_ABERTO_CLIENTE = _deliveryAberto;
+  AVISO_DELIVERY_CLIENTE  = _avisoDelivery;
+
+  // horario_extra_hoje: { data: 'YYYY-MM-DD', minutos: N }
+  // — extensão concedida pelo botão "+Horario" da aba Pedidos no admin
+  const _ext = data.horario_extra_hoje || null;
+  const _hojeStr = new Date().toISOString().split("T")[0];
+  const _extAtiva = !!(
+    _ext &&
+    _ext.data === _hojeStr &&
+    (Number(_ext.minutos) || 0) > 0
+  );
+  EXTENSAO_HORARIO_TEMP = _extAtiva ? Number(_ext.minutos) : 0;
 
   const agora = new Date();
   const horaAtual = agora.getHours() * 60 + agora.getMinutes();
@@ -472,6 +486,30 @@ async function verificarHorario() {
     } else {
       // Sem grade configurada → loja_aberta=true é suficiente para abrir
       estaAberto = true;
+    }
+  }
+
+  // ── Aplica extensão de horário (+Horario) ────────────────────────
+  // Se o cálculo normal disse "fechado" mas hoje tem uma extensão
+  // ativa concedida pelo admin, checa se estamos dentro da janela
+  // estendida (último fechamento + minutos concedidos).
+  if (!estaAberto && EXTENSAO_HORARIO_TEMP > 0 && data.horarios_semanais) {
+    const _diaConfigExt = data.horarios_semanais[diaKey];
+    if (_diaConfigExt && !_diaConfigExt.fechado) {
+      const _turnosValidosExt = (_diaConfigExt.turnos || []).filter(
+        (t) => t.abre && t.fecha,
+      );
+      if (_turnosValidosExt.length > 0) {
+        // Pega o MAIOR "fecha" do dia — é o ponto de fechamento real
+        // que a extensão empurra pra frente.
+        const _ultimoFecha = Math.max(
+          ..._turnosValidosExt.map((t) => horaParaMin(t.fecha)),
+        );
+        const _fechaEstendido = _ultimoFecha + EXTENSAO_HORARIO_TEMP;
+        if (horaAtual >= _ultimoFecha && horaAtual < _fechaEstendido) {
+          estaAberto = true;
+        }
+      }
     }
   }
 
@@ -562,6 +600,9 @@ async function verificarHorario() {
   if (data.cor_primaria) {
     document.documentElement.style.setProperty("--primary", data.cor_primaria);
   }
+
+  // ── Aplica estado do delivery (botão + banner de aviso) ──────────
+  _aplicarEstadoDeliveryCliente(_deliveryAberto, _avisoDelivery);
 }
 
 // ── Auto-scroll do modal ao revelar nova seção ───────────────────────────────
@@ -603,6 +644,76 @@ function _aplicarFormasPagamentoCliente(features) {
   });
 }
 
+// ── Aplica estado do delivery no app do cliente ───────────────────────────
+// Chamada por verificarHorario() após ler configuracoes. Quando o operador
+// clica em "Cerrar" na aba Pedidos do admin, este é o ponto do app do
+// cliente que reflete a mudança: desabilita o botão Delivery, força o modo
+// Retirada (se o cliente estava em delivery) e mostra um banner com o
+// aviso que o operador digitou.
+function _aplicarEstadoDeliveryCliente(aberto, aviso) {
+  // ── 1. Botão "Delivery" ──────────────────────────────────────────
+  const btnDel = document.getElementById("btn-delivery");
+  if (btnDel) {
+    if (!aberto) {
+      btnDel.disabled = true;
+      btnDel.style.opacity = "0.45";
+      btnDel.style.cursor = "not-allowed";
+      btnDel.style.pointerEvents = "none";
+      btnDel.title = aviso || "Delivery cerrado en este momento";
+      // Se o modo atual é delivery, força retirada — senão o cliente
+      // continuaria no modo proibido até tentar fechar a compra.
+      if (modoEntrega === "delivery") {
+        mudarModoEntrega("retirada");
+      }
+    } else {
+      btnDel.disabled = false;
+      btnDel.style.opacity = "1";
+      btnDel.style.cursor = "pointer";
+      btnDel.style.pointerEvents = "";
+      btnDel.title = "";
+    }
+  }
+
+  // ── 2. Banner de aviso (injetado dinamicamente) ──────────────────
+  let banner = document.getElementById("delivery-aviso-banner");
+  if (banner) banner.remove();
+
+  if (!aberto && aviso) {
+    banner = document.createElement("div");
+    banner.id = "delivery-aviso-banner";
+    banner.style.cssText = [
+      "background:#fff3cd",
+      "border:1px solid #ffc107",
+      "border-left:5px solid #e67e22",
+      "color:#7a5100",
+      "padding:12px 16px",
+      "margin:12px 20px 0",
+      "border-radius:10px",
+      "font-size:0.88rem",
+      "line-height:1.5",
+      "display:flex",
+      "align-items:flex-start",
+      "gap:10px",
+    ].join(";");
+    banner.innerHTML = `
+      <span style="font-size:1.3rem;line-height:1;flex-shrink:0">🛵</span>
+      <div>
+        <strong style="display:block;margin-bottom:3px;color:#8a5a00">Delivery cerrado en este momento</strong>
+        <span style="color:#8a5a00">${aviso}</span>
+      </div>`;
+    const anchor =
+      document.querySelector(".banner-area") ||
+      document.querySelector(".category-nav") ||
+      document.querySelector(".menu-container");
+    if (anchor && anchor.parentNode) {
+      anchor.parentNode.insertBefore(banner, anchor);
+    } else {
+      // fallback: cola direto no body
+      document.body.insertBefore(banner, document.body.firstChild);
+    }
+  }
+}
+
 // Renderiza o Menu (Categories + Produtos com subcategorias)
 
 // ── Verifica se a loja está aberta para receber pedidos agora ─────────────
@@ -613,6 +724,75 @@ function verificarLojaAbertaParaPedido() {
   // Se não conseguiu determinar pelo badge, assume aberto (evita bloquear por engano)
   if (!badge) return { aberto: true, proximoDia: null };
   return { aberto: estaAberto, proximoDia: null };
+}
+
+// ═════════════════════════════════════════════════════════════════
+//  ESTOQUE — Cliente final
+//  Carrega o inventário vinculado aos produtos do cardápio e permite
+//  bloquear a venda quando a quantidade chega a zero.
+// ═════════════════════════════════════════════════════════════════
+
+let _estoqueMapApp = {};
+
+async function _carregarEstoqueApp(produtos) {
+  const ids = new Set();
+  (produtos || []).forEach((p) => {
+    if (p.inventario_id) ids.add(p.inventario_id);
+    let cfg = p.montagem_config;
+    if (typeof cfg === "string") {
+      try { cfg = JSON.parse(cfg); } catch (_) { cfg = null; }
+    }
+    if (cfg && cfg.__tipo === "variacoes" && Array.isArray(cfg.variacoes)) {
+      cfg.variacoes.forEach((v) => {
+        if (v.inventario_id) ids.add(v.inventario_id);
+      });
+    }
+  });
+
+  _estoqueMapApp = {};
+  if (!ids.size) return;
+
+  try {
+    const { data } = await supa
+      .from("inventario")
+      .select("id, quantidade")
+      .in("id", [...ids]);
+    (data || []).forEach((i) => {
+      _estoqueMapApp[i.id] = i.quantidade ?? 0;
+    });
+  } catch (_) {
+    /* falha de rede não bloqueia cardápio */
+  }
+}
+
+// Retorna true se o produto está SEM estoque e deve ser ocultado/desabilitado.
+function _produtoSemEstoqueApp(p) {
+  let cfg = p.montagem_config;
+  if (typeof cfg === "string") {
+    try { cfg = JSON.parse(cfg); } catch (_) { cfg = null; }
+  }
+
+  // (a) Inventário direto
+  if (p.inventario_id && p.inventario_id in _estoqueMapApp) {
+    if (_estoqueMapApp[p.inventario_id] <= 0) return true;
+  }
+
+  // (b) Multivariação — bloqueia só se todas as ativas estiverem zeradas
+  if (cfg && cfg.__tipo === "variacoes" && Array.isArray(cfg.variacoes)) {
+    const ativas = cfg.variacoes.filter((v) => v.ativo !== false);
+    if (ativas.length > 0) {
+      const comControle = ativas.filter((v) => v.inventario_id);
+      const semControle = ativas.filter((v) => !v.inventario_id);
+      if (comControle.length > 0 && semControle.length === 0) {
+        const todasZeradas = comControle.every(
+          (v) => (_estoqueMapApp[v.inventario_id] ?? 0) <= 0
+        );
+        if (todasZeradas) return true;
+      }
+    }
+  }
+
+  return false;
 }
 
 // ── Mostra alerta quando a loja está fechada ──────────────────────────────
@@ -685,6 +865,10 @@ async function renderMenu() {
     return;
   }
 
+  // ── Carrega o mapa de estoque e filtra produtos zerados ───────
+  await _carregarEstoqueApp(produtos);
+  const _produtosDisponiveis = produtos.filter((p) => !_produtoSemEstoqueApp(p));
+
   const subcats = subcatsDb || [];
 
   // Monta mapa: categoria_slug -> lista de subcategorias
@@ -699,7 +883,7 @@ async function renderMenu() {
   const prodPorSubcat = {};
   const prodSemSubcat = {};
 
-  produtos.forEach((p) => {
+  _produtosDisponiveis.forEach((p) => {
     const cat = p.categoria_slug;
     const sub = p.subcategoria_slug;
     const item = {
@@ -733,17 +917,22 @@ async function renderMenu() {
   const minAgora = agora.getHours() * 60 + agora.getMinutes();
 
   function categoriaVisivel(cat) {
-    // Filtro por dia da semana (0=Dom...6=Sáb, igual ao Date.getDay())
-    if (Array.isArray(cat.dias_semana) && cat.dias_semana.length > 0) {
-      if (!cat.dias_semana.includes(agora.getDay())) return false;
-    }
-    if (!cat.hora_inicio || !cat.hora_fim) return true;
-    const [hI, mI] = cat.hora_inicio.split(":").map(Number);
-    const [hF, mF] = cat.hora_fim.split(":").map(Number);
-    const inicio = hI * 60 + mI;
-    const fim = hF * 60 + mF;
-    if (fim < inicio) return minAgora >= inicio || minAgora <= fim;
-    return minAgora >= inicio && minAgora <= fim;
+  // Filtro por dia da semana (0=Dom...6=Sáb, igual ao Date.getDay())
+  if (Array.isArray(cat.dias_semana) && cat.dias_semana.length > 0) {
+    // Converte tudo para número para garantir que a comparação funcione
+    const diasInt = cat.dias_semana.map(Number);
+    if (!diasInt.includes(agora.getDay())) return false;
+  }
+  
+  if (!cat.hora_inicio || !cat.hora_fim) return true;
+  
+  const [hI, mI] = cat.hora_inicio.split(":").map(Number);
+  const [hF, mF] = cat.hora_fim.split(":").map(Number);
+  const inicio = hI * 60 + mI;
+  const fim = hF * 60 + mF;
+  
+  if (fim < inicio) return minAgora >= inicio || minAgora <= fim;
+  return minAgora >= inicio && minAgora <= fim;
   }
 
   function renderProdutoDiv(item) {
@@ -895,9 +1084,25 @@ let _comboFechadoConfig = {
 };
 
 function abrirModal(item) {
+  // Dupla checagem: mesmo que o card apareça, bloqueia no clique.
+  if (_produtoSemEstoqueApp(item)) {
+    mostrarToast(
+      tt({
+        es: "⚠️ Producto sin stock. Intente más tarde.",
+        pt: "⚠️ Produto sem estoque. Tente mais tarde.",
+        en: "⚠️ Product out of stock. Try again later.",
+        de: "⚠️ Produkt nicht vorrätig. Versuchen Sie es später.",
+      }),
+      "warning",
+      3000
+    );
+    return;
+  }
+
   prodAtual = item;
   qtd = 1;
   itensMontagem = {};
+  
   _pizzaConfig = {
     p: null,
     tamanhoSelecionado: null,
@@ -1290,49 +1495,94 @@ function _selecionarSaborSlot(slot, nome, preco, el, tipo) {
 }
 
 /* Passo 4: Borda */
+function _getPrecoBordaEspecifica(tam, borda) {
+  if (!tam || !borda) return 0;
+  
+  // Lê o preço do novo formato (precos por tamanho, salvo pelo builder)
+  if (borda.precos && borda.precos[tam.nome] !== undefined) {
+    return Number(borda.precos[tam.nome]) || 0;
+  }
+  
+  // Fallback para o formato antigo (caso exista)
+  const tipo = (borda.tipo || "Tradicional").toLowerCase();
+  if (tipo === "doce") return tam.borda_preco_doce || tam.borda_preco || 0;
+  if (tipo === "premium") return tam.borda_preco_premium || tam.borda_preco || 0;
+  if (tipo === "especial") return tam.borda_preco_especial || tam.borda_preco || 0;
+  return tam.borda_preco || 0;
+}
+
+function _getPrecoBordaAtual() {
+  if (!_pizzaConfig.bordaConfig || !_pizzaConfig.tamanhoSelecionado) return 0;
+  return _getPrecoBordaEspecifica(_pizzaConfig.tamanhoSelecionado, _pizzaConfig.bordaConfig);
+}
+
 function _revelarPasso4Borda() {
   const p = _pizzaConfig.p;
   const p4 = document.getElementById("pizza-passo4");
   if (!p4) return;
 
-  // Monta opções de borda
-  const bordasOpcoes = p.bordas && p.bordas.length > 0 ? p.bordas : [];
+  const tamAtual = _pizzaConfig.tamanhoSelecionado;
+  const bordasOpcoes =
+    p.bordas && p.bordas.length > 0
+      ? p.bordas
+      : p.tem_borda
+        ? [{ nome: "Borda Recheada", tipo: "Tradicional" }]
+        : [];
 
-p4.innerHTML = `<section class="pizza-step">
-  <div class="pizza-step-header">
-    <span class="pizza-step-num">4</span>
-    <span>${tt({es:"Borda recheada?",pt:"Borda recheada?",en:"Stuffed crust?",de:"Gefüllter Rand?"})}</span>
-  </div>
-  <div class="pizza-opt-row">
-    <button type="button" class="pizza-opt-chip selected" id="borda-nao"
-      onclick="_pizzaSelecionarBorda(null, null)">
-      ${tt({es:"Sin borde",pt:"Sem borda",en:"No crust",de:"Ohne Rand"})}
-    </button>
-    ${bordasOpcoes.map(b => {
-      const precoAtual = _precoBordaPorTamanho(b, _pizzaConfig.tamanhoSelecionado);
-      return `
-        <button type="button" class="pizza-opt-chip"
-          onclick='_pizzaSelecionarBorda(${JSON.stringify(b)}, this)'>
-          🧀 ${b.nome}
-          ${precoAtual > 0
-            ? `<span style="font-size:0.75rem;opacity:0.85">+Gs ${precoAtual.toLocaleString("es-PY")}</span>`
-            : ""}
+  p4.innerHTML = `<section class="pizza-step">
+    <div class="pizza-step-header">
+      <span class="pizza-step-num">4</span>
+      <span>Borda recheada?</span>
+    </div>
+    <div class="pizza-opt-row">
+      <button type="button" class="pizza-opt-chip selected" id="borda-nao" onclick="_pizzaSelecionarBorda(null, null, null)">
+        Sem borda
+      </button>
+      ${bordasOpcoes
+        .map((b) => {
+          const precoBorda = _getPrecoBordaEspecifica(tamAtual, b);
+          return `
+        <button type="button" class="pizza-opt-chip" onclick="_pizzaSelecionarBorda('${b.nome.replace(/'/g, "\\'")}', '${b.tipo || "Tradicional"}', this)">
+          🧀 ${b.nome} ${precoBorda > 0 ? `<span style="font-size:0.75rem;opacity:0.85">+Gs ${precoBorda.toLocaleString("es-PY")}</span>` : ''}
         </button>`;
-    }).join("")}
-  </div>
-</section>`;
+        })
+        .join("")}
+    </div>
+  </section>`;
   p4.style.display = "block";
   _scrollModalParaElemento(p4);
 }
 
-function _pizzaSelecionarBorda(bordaObj, el) {
-  document.querySelectorAll("#pizza-passo4 .pizza-opt-chip")
-    .forEach(c => c.classList.remove("selected"));
+function _pizzaSelecionarBorda(nome, tipo, el) {
+  document
+    .querySelectorAll("#pizza-passo4 .pizza-opt-chip")
+    .forEach((c) => c.classList.remove("selected"));
   if (el) el.classList.add("selected");
   else document.getElementById("borda-nao")?.classList.add("selected");
-  _pizzaConfig.bordaConfig = bordaObj;   // guarda o objeto completo
+  
+  if (nome) {
+    // AQUI ESTAVA O BUG: precisamos buscar o objeto inteiro da borda
+    // para pegar os preços (P, M, G) e não apenas o nome.
+    const p = _pizzaConfig.p;
+    const bordaObj = (p.bordas || []).find(b => b.nome === nome);
+    
+    // Salva o objeto inteiro (com a propriedade `precos`)
+    _pizzaConfig.bordaConfig = bordaObj ? { ...bordaObj } : { nome, tipo };
+  } else {
+    _pizzaConfig.bordaConfig = null;
+  }
+  
   _atualizarPrecoPizza();
   _atualizarResumo();
+}
+
+// Compatibilidade com chamadas antigas
+function _selecionarBorda(com) {
+  _pizzaSelecionarBorda(
+    com ? "Borda Recheada" : null,
+    "Tradicional",
+    null,
+  );
 }
 
 // compatibilidade
@@ -1356,29 +1606,26 @@ function _atualizarResumo() {
     "premium": "💎", "doce premium": "🎂", "doce": "🍫",
     "vegano": "🌱", "picante": "🌶️",
   };
-  const n          = _pizzaConfig.numSabores || 1;
-  const tam        = _pizzaConfig.tamanhoSelecionado;
-  const precoBase  = _calcularBasePizza(tam, saboresOk);
-  const precoBorda = _precoBordaPorTamanho(
-    _pizzaConfig.bordaConfig,
-    _pizzaConfig.tamanhoSelecionado
-  );
+  const n = _pizzaConfig.numSabores || 1;
+  const tam = _pizzaConfig.tamanhoSelecionado;
+  const precoBase = _calcularBasePizza(tam, saboresOk);
+  
+  // AQUI TAMBÉM: puxa o valor da borda dinamicamente
+  const precoBorda = _getPrecoBordaAtual();
 
   const linhasSabores = saboresOk.map((s, i) => {
-    const tl   = (s.tipo || "").toLowerCase();
+    const tl = (s.tipo || "").toLowerCase();
     const icon = tipoIcons[tl] || "🍕";
-    const tipoTag = s.tipo
-      ? ` <span style="font-size:.75em;opacity:.65">(${s.tipo})</span>`
-      : "";
+    const tipoTag = s.tipo ? ` <span style="font-size:.75em;opacity:.65">(${s.tipo})</span>` : "";
     return `<div class="pizza-resumo-linha">
-      <span>${n > 1 ? `${i+1}/${n} Sabor` : "Sabor"}</span>
+      <span>${n > 1 ? `${i + 1}/${n} Sabor` : "Sabor"}</span>
       <span>${icon} ${s.nome}${tipoTag}</span>
     </div>`;
   }).join("");
 
   const notaPreco = n > 1 && saboresOk.some(s => s.tipo)
     ? `<div style="font-size:.68rem;color:#888;padding:4px 14px;background:#fffbf0">
-         ★ ${tt({es:"Prevalece el precio del tipo más caro",pt:"Prevalece o preço do tipo mais caro",en:"The most expensive type price prevails",de:"Der Preis der teuersten Art gilt"})}
+         ★ ${tt({es: "Prevalece el precio del tipo más caro", pt: "Prevalece o preço do tipo mais caro", en: "The most expensive type price prevails", de: "Der Preis der teuersten Art gilt"})}
        </div>`
     : "";
 
@@ -1399,26 +1646,15 @@ function _atualizarResumo() {
 // ══════════════════════════════════════════════════════════
 function _precoPizzaPorTipo(tam, tipo) {
   if (!tam) return 0;
+  // tam.precos é o mapa tipo→preço salvo pelo admin
   const precos = tam.precos || {};
-
-  // 1) Match exato
+  // Tenta exato primeiro, depois case-insensitive
   if (tipo && precos[tipo] > 0) return precos[tipo];
-
-  // 2) Match case-insensitive
   if (tipo) {
-    const chave = Object.keys(precos).find(
-      (k) => k.toLowerCase() === tipo.toLowerCase(),
-    );
+    const chave = Object.keys(precos).find(k => k.toLowerCase() === tipo.toLowerCase());
     if (chave && precos[chave] > 0) return precos[chave];
   }
-
-  // 3) Fallback: se o tipo não bate com nenhum preço, usa o MAIOR preço
-  //    do tamanho (para não cobrar a menos se o sabor é premium) — não o
-  //    preco mínimo, que geraria "Gs 0" quando todos os tipos são nulos.
-  const vals = Object.values(precos).filter((v) => v > 0);
-  if (vals.length) return Math.max(...vals);
-
-  // 4) Último recurso: preço base do produto
+  // Fallback: preco mínimo do tamanho
   return tam.preco || 0;
 }
 
@@ -1615,72 +1851,57 @@ function _cfAtualizarUI() {
 function _atualizarPrecoPizza() {
   const cfg = prodAtual?.montagem;
 
-  // Sempre soma extras (válido para qualquer tipo de produto)
   let extrasTotal = 0;
   document.querySelectorAll(".extra-check-input:checked").forEach((cb) => {
     extrasTotal += parseInt(cb.dataset.preco || 0);
   });
 
-  // Tipo variações: preço controlado pelo click na variação
   const tipo = cfg && !Array.isArray(cfg) && cfg.__tipo ? cfg.__tipo : "padrao";
   if (tipo === "variacoes") {
-    const base = _variacaoSelecionada
-      ? _variacaoSelecionada.preco || 0
-      : prodAtual?.preco || 0;
-    const total = (base + extrasTotal) * qtd;
-    document.getElementById("modal-price").innerText =
-      `Gs ${total.toLocaleString("es-PY")}`;
+    const base = _variacaoSelecionada ? _variacaoSelecionada.preco || 0 : prodAtual?.preco || 0;
+    document.getElementById("modal-price").innerText = `Gs ${((base + extrasTotal) * qtd).toLocaleString("es-PY")}`;
     _atualizarResumo();
     return;
   }
 
-  // Tipos com builder próprio: shake / sorvete / açaí / suco
   if (tipo === "shake") {
-    const base = (_shakeConfig.tamanho?.preco || prodAtual?.preco || 0)
-               + (_shakeConfig.sabor?.preco || 0);
-    document.getElementById("modal-price").innerText =
-      `Gs ${((base + extrasTotal) * qtd).toLocaleString("es-PY")}`;
+    const base = (_shakeConfig.tamanho?.preco || prodAtual?.preco || 0) + (_shakeConfig.sabor?.preco || 0);
+    document.getElementById("modal-price").innerText = `Gs ${((base + extrasTotal) * qtd).toLocaleString("es-PY")}`;
     return;
   }
   if (tipo === "sorvete") {
     const base = _sorveteConfig.tamanho?.preco || prodAtual?.preco || 0;
-    document.getElementById("modal-price").innerText =
-      `Gs ${((base + extrasTotal) * qtd).toLocaleString("es-PY")}`;
+    document.getElementById("modal-price").innerText = `Gs ${((base + extrasTotal) * qtd).toLocaleString("es-PY")}`;
     return;
   }
   if (tipo === "acai") {
     const base = _acaiConfig.tamanho?.preco || prodAtual?.preco || 0;
-    document.getElementById("modal-price").innerText =
-      `Gs ${((base + extrasTotal) * qtd).toLocaleString("es-PY")}`;
+    document.getElementById("modal-price").innerText = `Gs ${((base + extrasTotal) * qtd).toLocaleString("es-PY")}`;
     return;
   }
   if (tipo === "suco") {
     const base = _sucoConfig.tamanho?.preco || prodAtual?.preco || 0;
-    document.getElementById("modal-price").innerText =
-      `Gs ${((base + extrasTotal) * qtd).toLocaleString("es-PY")}`;
+    document.getElementById("modal-price").innerText = `Gs ${((base + extrasTotal) * qtd).toLocaleString("es-PY")}`;
     return;
   }
 
-  // Suporta ambos: cfg.pizza (novo) ou cfg direto (antigo)
   const p = _pizzaConfig.p;
   if (!p || !p.tamanhos) {
     const base = prodAtual?.preco || 0;
     const total = (base + extrasTotal) * qtd;
-    document.getElementById("modal-price").innerText =
-      `Gs ${total.toLocaleString("es-PY")}`;
+    document.getElementById("modal-price").innerText = `Gs ${total.toLocaleString("es-PY")}`;
     _atualizarResumo();
     return;
   }
   const saboresOk = (_pizzaConfig.sabores || []).filter(Boolean);
-  const tam       = _pizzaConfig.tamanhoSelecionado;
-  const precoBase  = _calcularBasePizza(tam, saboresOk.length ? saboresOk : []) || prodAtual?.preco || 0;
-  const precoBorda = _precoBordaPorTamanho(
-    _pizzaConfig.bordaConfig,
-    _pizzaConfig.tamanhoSelecionado
-  );
+  const tam = _pizzaConfig.tamanhoSelecionado;
+  const precoBase = _calcularBasePizza(tam, saboresOk.length ? saboresOk : []) || prodAtual?.preco || 0;
+  
+  // AQUI ESTAVA O BUG: agora usa a função que calcula o preço da borda baseado no tamanho e tipo
+  const precoBorda = _getPrecoBordaAtual(); 
+  
   const total = (precoBase + precoBorda + extrasTotal) * qtd;
-  document.getElementById("modal-price").innerText =
-    `Gs ${total.toLocaleString("es-PY")}`;
+  document.getElementById("modal-price").innerText = `Gs ${total.toLocaleString("es-PY")}`;
   _atualizarResumo();
 }
 
@@ -2400,7 +2621,9 @@ function adicionarDoModal() {
   // Monta descrição para o carrinho
   let montagem = [];
   let variacao = "";
-  let precoFinal = prodAtual.preco;
+  
+  // AQUI ESTAVA O ERRO: A variável foi declarada agora no topo, antes de qualquer if.
+  let precoFinal = prodAtual.preco || 0; 
 
   if (tipo === "combo_fechado") {
     const partes = _comboFechadoConfig.sabores
@@ -2426,19 +2649,11 @@ function adicionarDoModal() {
   }
 
   if (tipo === "pizza") {
-    // ─────────────────────────────────────────────────────────────
-    // PREÇO PIZZA:
-    //   Base    = tamanho selecionado (sempre — é o preço principal)
-    //   Extra   = maior preco individual dos sabores (0 se não há premium)
-    //   Borda   = preco da borda escolhida (0 se sem borda)
-    //   Total   = (Base + Extra) * qtd + Borda * qtd
-    // ─────────────────────────────────────────────────────────────
     const saboresOk = (_pizzaConfig.sabores || []).filter(Boolean);
     const _tam       = _pizzaConfig.tamanhoSelecionado;
-    const precoBorda = _precoBordaPorTamanho(
-      _pizzaConfig.bordaConfig,
-      _pizzaConfig.tamanhoSelecionado
-    );
+    
+    // Puxa o preço da borda dinamicamente do objeto salvo
+    const precoBorda = _getPrecoBordaAtual();
     precoFinal = _calcularBasePizza(_tam, saboresOk) + precoBorda;
 
     variacao = _pizzaConfig.tamanhoSelecionado?.nome || "";
@@ -2447,7 +2662,6 @@ function adicionarDoModal() {
       .map((s, i) => (numSab > 1 ? `${i + 1}/${numSab} ${s.nome}` : s.nome))
       .join(" | ");
 
-    // montagem: string legível para exibição no carrinho/cozinha
     montagem = [saboresStr].filter(Boolean);
     if (_pizzaConfig.bordaConfig)
       montagem.push(`Borda: ${_pizzaConfig.bordaConfig.nome}`);
@@ -2463,19 +2677,16 @@ function adicionarDoModal() {
   if (tipo === "variacoes" && _variacaoSelecionada) {
     variacao = _variacaoSelecionada.nome;
     precoFinal = _variacaoSelecionada.preco || prodAtual.preco;
-    // Usa imagem da variação se disponível
     if (_variacaoSelecionada.img)
       prodAtual._variacaoImg = _variacaoSelecionada.img;
   }
 
-  // ── shake ────────────────────────────────────────────────────
   if (tipo === "shake") {
     precoFinal = (_shakeConfig.tamanho?.preco || 0) + (_shakeConfig.sabor?.preco || 0);
     variacao   = _shakeConfig.tamanho?.nome || "";
     if (_shakeConfig.sabor) montagem = [_shakeConfig.sabor.nome];
   }
 
-  // ── sorvete ──────────────────────────────────────────────────
   if (tipo === "sorvete") {
     precoFinal = _sorveteConfig.tamanho?.preco || prodAtual.preco;
     variacao   = _sorveteConfig.tamanho?.nome || "";
@@ -2486,7 +2697,6 @@ function adicionarDoModal() {
     });
   }
 
-  // ── açaí ─────────────────────────────────────────────────────
   if (tipo === "acai") {
     precoFinal = _acaiConfig.tamanho?.preco || prodAtual.preco;
     variacao   = _acaiConfig.tamanho?.nome || "";
@@ -2495,7 +2705,6 @@ function adicionarDoModal() {
     });
   }
 
-  // ── suco ─────────────────────────────────────────────────────
   if (tipo === "suco") {
     precoFinal = _sucoConfig.tamanho?.preco || prodAtual.preco;
     variacao   = _sucoConfig.tamanho?.nome || "";
@@ -2536,7 +2745,7 @@ function adicionarDoModal() {
 
   carrinho.push({
     id: Date.now(),
-    produto_id: prodAtual.id || null, // ID real do banco — necessário para desconto de estoque
+    produto_id: prodAtual.id || null,
     nome: prodAtual.nome,
     variacao: variacao || "",
     preparo: preparoEscolhido,
@@ -2545,7 +2754,7 @@ function adicionarDoModal() {
     montagem: montagem.filter(Boolean),
     obs: document.getElementById("modal-obs").value,
     img: prodAtual._variacaoImg || prodAtual.img,
-    categoria_slug: prodAtual.categoria_slug || "", // para filtro bebidas no motoboy
+    categoria_slug: prodAtual.categoria_slug || "",
     es_bebida: prodAtual.es_bebida || false,
     ...(pizzaMeta ? { pizzaMeta } : {}),
   });
@@ -2914,16 +3123,6 @@ function toggleFactura() {
 
 function verificarPagamento() {
   const pag = document.getElementById("forma-pag").value;
-  const pagFinal =
-    pag === "CartaoBR"
-      ? _cartaoBRTipo === "debito"
-        ? tt({es:"Tarjeta BR - Débito",pt:"Cartão BR - Débito",en:"Card BR - Debit",de:"Karte BR - Debit"})
-        : tt({es:"Tarjeta BR - Crédito",pt:"Cartão BR - Crédito",en:"Card BR - Credit",de:"Karte BR - Kredit"})
-      : pag === "Cartao"
-        ? _cartaoPYTipo === "debito"
-          ? tt({es:"Tarjeta - Débito",pt:"Cartão - Débito",en:"Card - Debit",de:"Karte - Debit"})
-          : tt({es:"Tarjeta - Crédito",pt:"Cartão - Crédito",en:"Card - Credit",de:"Karte - Kredit"})
-        : pag;
   const infoDiv = document.getElementById("info-pagamento-extra");
   const boxTroco = document.getElementById("box-troco");
   const boxMulti = document.getElementById("box-multipagamento");
@@ -2933,162 +3132,105 @@ function verificarPagamento() {
   boxTroco.classList.add("hidden");
   if (boxMulti) boxMulti.style.display = "none";
 
-  if (pag === "Efetivo") {
-    boxTroco.classList.remove("hidden");
-  } else if (pag === "CartaoBR") {
-    infoDiv.style.display = "block";
-
-    const _calcTotalGs = () => {
-      const totalItens = carrinho.reduce((a, i) => a + i.preco * i.qtd, 0);
-      let frete = modoEntrega === "delivery" ? Math.max(0, freteCalculado) : 0;
-      let desconto = 0;
-      if (cupomAplicado) {
-        if (cupomAplicado.tipo === "percentual")
-          desconto = Math.round(totalItens * (cupomAplicado.valor / 100));
-        else if (cupomAplicado.tipo === "frete") frete = 0;
-      }
-      return totalItens - desconto + frete;
-    };
-
-    const _renderCartaoBR = () => {
-      const totalGs = _calcTotalGs();
-      const taxa =
-        _cartaoBRTipo === "debito" ? TAXA_DEBITO_BR : TAXA_CREDITO_BR;
-      const brl =
-        COTACAO_REAL > 0 && totalGs > 0
-          ? ((totalGs / COTACAO_REAL) * (1 + taxa / 100)).toFixed(2)
-          : "---";
-      const el = document.getElementById("info-pagamento-extra");
-      if (!el) return;
-      el.style.display = "block";
-      el.innerHTML = `
-        <div style="font-weight:700;margin-bottom:8px;font-size:0.9rem">💳🇧🇷 Cartão Brasileiro</div>
-        <div style="display:flex;gap:8px;margin-bottom:10px">
-          <button type="button" onclick="window._setBRTipo('debito')"
-            style="flex:1;padding:9px 6px;border-radius:8px;font-weight:700;cursor:pointer;font-size:0.83rem;
-                   border:2px solid ${_cartaoBRTipo === "debito" ? "#1a7a2e" : "#ccc"};
-                   background:${_cartaoBRTipo === "debito" ? "#eafaf1" : "#f8f9fa"};
-                   color:${_cartaoBRTipo === "debito" ? "#1a7a2e" : "#555"}">
-            💳 Débito<br><small style="font-weight:400">${TAXA_DEBITO_BR.toFixed(2).replace(".", ",")}%</small>
-          </button>
-          <button type="button" onclick="window._setBRTipo('credito')"
-            style="flex:1;padding:9px 6px;border-radius:8px;font-weight:700;cursor:pointer;font-size:0.83rem;
-                   border:2px solid ${_cartaoBRTipo === "credito" ? "#1a7a2e" : "#ccc"};
-                   background:${_cartaoBRTipo === "credito" ? "#eafaf1" : "#f8f9fa"};
-                   color:${_cartaoBRTipo === "credito" ? "#1a7a2e" : "#555"}">
-            💳 Crédito<br><small style="font-weight:400">${TAXA_CREDITO_BR.toFixed(2).replace(".", ",")}%</small>
-          </button>
-        </div>
-        <div style="background:#fff;border:1.5px solid #1a7a2e;border-radius:8px;padding:10px;text-align:center">
-          <div style="font-size:0.78rem;color:#666;margin-bottom:2px">Valor a cobrar (com taxa)</div>
-          <div style="font-size:1.3rem;font-weight:900;color:#1a7a2e">
-            ${brl === "---" ? '<span style="font-size:0.9rem;color:#999">Adicione itens ao carrinho</span>' : "R$ " + brl}
-          </div>
-        </div>`;
-    };
-
-    window._renderCartaoBR = _renderCartaoBR;
-    window._setBRTipo = (tipo) => {
-      _cartaoBRTipo = tipo;
-      window._renderCartaoBR();
-    };
-    _renderCartaoBR();
-  } else if (pag === "Cartao") {
-    infoDiv.style.display = "block";
-
-    const _calcTotalGsPY = () => {
-      const totalItens = carrinho.reduce((a, i) => a + i.preco * i.qtd, 0);
-      let frete = modoEntrega === "delivery" ? Math.max(0, freteCalculado) : 0;
-      let desconto = 0;
-      if (cupomAplicado) {
-        if (cupomAplicado.tipo === "percentual")
-          desconto = Math.round(totalItens * (cupomAplicado.valor / 100));
-        else if (cupomAplicado.tipo === "frete") frete = 0;
-      }
-      return totalItens - desconto + frete;
-    };
-
-    const _renderCartaoPY = () => {
-      const totalGs = _calcTotalGsPY();
-      const taxa = _cartaoPYTipo === "debito" ? TAXA_DEBITO_BR : TAXA_CREDITO_BR;
-      const totalComTaxa =
-        totalGs > 0 ? Math.round(totalGs * (1 + taxa / 100)) : 0;
-      const el = document.getElementById("info-pagamento-extra");
-      if (!el) return;
-      el.style.display = "block";
-      el.innerHTML = `
-        <div style="font-weight:700;margin-bottom:8px;font-size:0.9rem">💳 Tarjeta</div>
-        <div style="display:flex;gap:8px;margin-bottom:10px">
-          <button type="button" onclick="window._setPYTipo('debito')"
-            style="flex:1;padding:9px 6px;border-radius:8px;font-weight:700;cursor:pointer;font-size:0.83rem;
-                   border:2px solid ${_cartaoPYTipo === "debito" ? "#1a7a2e" : "#ccc"};
-                   background:${_cartaoPYTipo === "debito" ? "#eafaf1" : "#f8f9fa"};
-                   color:${_cartaoPYTipo === "debito" ? "#1a7a2e" : "#555"}">
-            💳 Débito<br><small style="font-weight:400">${TAXA_DEBITO_BR.toFixed(2).replace(".", ",")}%</small>
-          </button>
-          <button type="button" onclick="window._setPYTipo('credito')"
-            style="flex:1;padding:9px 6px;border-radius:8px;font-weight:700;cursor:pointer;font-size:0.83rem;
-                   border:2px solid ${_cartaoPYTipo === "credito" ? "#1a7a2e" : "#ccc"};
-                   background:${_cartaoPYTipo === "credito" ? "#eafaf1" : "#f8f9fa"};
-                   color:${_cartaoPYTipo === "credito" ? "#1a7a2e" : "#555"}">
-            💳 Crédito<br><small style="font-weight:400">${TAXA_CREDITO_BR.toFixed(2).replace(".", ",")}%</small>
-          </button>
-        </div>
-        <div style="background:#fff;border:1.5px solid #1a7a2e;border-radius:8px;padding:10px;text-align:center">
-          <div style="font-size:0.78rem;color:#666;margin-bottom:2px">Valor a cobrar (con tasa)</div>
-          <div style="font-size:1.3rem;font-weight:900;color:#1a7a2e">
-            ${totalComTaxa === 0 ? '<span style="font-size:0.9rem;color:#999">Adicione itens ao carrinho</span>' : "Gs " + totalComTaxa.toLocaleString("es-PY")}
-          </div>
-        </div>`;
-    };
-
-    window._renderCartaoPY = _renderCartaoPY;
-    window._setPYTipo = (tipo) => {
-      _cartaoPYTipo = tipo;
-      window._renderCartaoPY();
-    };
-    _renderCartaoPY();
-  } else if (pag === "Pix") {
-    infoDiv.style.display = "block";
+  // Helper local: calcula total atual sem depender do chamador
+  const _calcTotalGs = () => {
     const totalItens = carrinho.reduce((a, i) => a + i.preco * i.qtd, 0);
-    let freteAplicado =
-      modoEntrega === "delivery" ? Math.max(0, freteCalculado) : 0;
+    let frete = modoEntrega === "delivery" ? Math.max(0, freteCalculado) : 0;
     let desconto = 0;
     if (cupomAplicado) {
       if (cupomAplicado.tipo === "percentual")
         desconto = Math.round(totalItens * (cupomAplicado.valor / 100));
-      else if (cupomAplicado.tipo === "frete") freteAplicado = 0;
+      else if (cupomAplicado.tipo === "frete") frete = 0;
     }
-    const totalGs = totalItens - desconto + freteAplicado;
-    const totalBrl =
-      COTACAO_REAL > 0 ? (totalGs / COTACAO_REAL).toFixed(2) : "---";
+    return totalItens - desconto + frete;
+  };
+
+  // ── EFETIVO → mostra campo de troco ────────────────────────
+  if (pag === "Efetivo") {
+    boxTroco.classList.remove("hidden");
+    return;
+  }
+
+  // ── CARTÃO BR (Débito / Crédito) ───────────────────────────
+  if (pag === "TarjetaBRDebito" || pag === "TarjetaBRCredito") {
+    const tipo = pag === "TarjetaBRDebito" ? "debito" : "credito";
+    const taxa = tipo === "debito" ? TAXA_DEBITO_BR : TAXA_CREDITO_BR;
+    const totalGs = _calcTotalGs();
+    const brl = COTACAO_REAL > 0 && totalGs > 0
+      ? ((totalGs / COTACAO_REAL) * (1 + taxa / 100)).toFixed(2)
+      : "---";
+    infoDiv.style.display = "block";
+    infoDiv.innerHTML = `
+      <div style="font-weight:700;margin-bottom:8px;font-size:0.9rem">💳🇧🇷 Tarjeta Brasileña (${tipo === "debito" ? "Débito" : "Crédito"})</div>
+      <div style="background:#fff;border:1.5px solid #1a7a2e;border-radius:8px;padding:10px;text-align:center">
+        <div style="font-size:0.78rem;color:#666;margin-bottom:2px">Valor a cobrar (con tasa ${taxa.toFixed(2).replace(".", ",")}%)</div>
+        <div style="font-size:1.3rem;font-weight:900;color:#1a7a2e">
+          ${brl === "---" ? '<span style="font-size:0.9rem;color:#999">Adicione itens ao carrinho</span>' : "R$ " + brl}
+        </div>
+      </div>`;
+    return;
+  }
+
+  // ── CARTÃO PY (Débito / Crédito) ───────────────────────────
+  if (pag === "TarjetaDebito" || pag === "TarjetaCredito") {
+    const tipo = pag === "TarjetaDebito" ? "debito" : "credito";
+    const taxa = tipo === "debito" ? TAXA_DEBITO_BR : TAXA_CREDITO_BR;
+    const totalGs = _calcTotalGs();
+    const totalComTaxa = totalGs > 0 ? Math.round(totalGs * (1 + taxa / 100)) : 0;
+    infoDiv.style.display = "block";
+    infoDiv.innerHTML = `
+      <div style="font-weight:700;margin-bottom:8px;font-size:0.9rem">💳 Tarjeta (${tipo === "debito" ? "Débito" : "Crédito"})</div>
+      <div style="background:#fff;border:1.5px solid #1a7a2e;border-radius:8px;padding:10px;text-align:center">
+        <div style="font-size:0.78rem;color:#666;margin-bottom:2px">Valor a cobrar (con tasa ${taxa.toFixed(2).replace(".", ",")}%)</div>
+        <div style="font-size:1.3rem;font-weight:900;color:#1a7a2e">
+          ${totalComTaxa === 0 ? '<span style="font-size:0.9rem;color:#999">Adicione itens ao carrinho</span>' : "Gs " + totalComTaxa.toLocaleString("es-PY")}
+        </div>
+      </div>`;
+    return;
+  }
+
+  // ── PIX ────────────────────────────────────────────────────
+  if (pag === "Pix") {
+    infoDiv.style.display = "block";
+    const totalGs = _calcTotalGs();
+    const totalBrl = COTACAO_REAL > 0 ? (totalGs / COTACAO_REAL).toFixed(2) : "---";
     infoDiv.innerHTML = `<strong>💳 Chave Pix:</strong><br>${CHAVE_PIX}<br><small>Titular: ${NOME_PIX}</small><br><strong style="color:#27ae60;font-size:1rem">💰 Valor: R$ ${totalBrl}</strong>`;
-  } else if (pag === "Transferencia") {
+    return;
+  }
+
+  // ── TRANSFERÊNCIA / ALIAS ─────────────────────────────────
+  if (pag === "Transferencia") {
     infoDiv.style.display = "block";
     const qrHtml = QR_ALIAS_URL
       ? `<br><img src="${QR_ALIAS_URL}" alt="QR Alias" style="width:160px;height:160px;margin-top:8px;border-radius:8px;border:2px solid #e0e0e0">`
       : "";
     infoDiv.innerHTML = `<strong>🏦 Transferencia / Alias:</strong><br>${DADOS_ALIAS}<br>${ALIAS_PY}${qrHtml}`;
-  } else if (pag === "QrPy") {
+    return;
+  }
+
+  // ── QR ─────────────────────────────────────────────────────
+  if (pag === "Qr") {
     infoDiv.style.display = "block";
     const qrPyHtml = QR_PY_URL
       ? `<br><img src="${QR_PY_URL}" alt="QR Paraguay" style="width:160px;height:160px;margin-top:8px;border-radius:8px;border:2px solid #e0e0e0">`
       : "";
     infoDiv.innerHTML = `<strong>📱 QR Paraguay:</strong><br><small>Tigo Money · Personal Pay · Bancard</small>${qrPyHtml}<br><small style="color:#888">Escaneie e envie o comprovante</small>`;
-  } else if (pag === "Multipagamento") {
+    return;
+  }
+
+  // ── MULTIPAGAMENTO ────────────────────────────────────────
+  if (pag === "Multipagamento") {
     if (boxMulti) {
       boxMulti.style.display = "block";
-      // Esconde o select enquanto está no modo multi
       selectPag.style.display = "none";
-      // Inicializa com 2 formas se ainda não há nenhuma
       const partes = document.getElementById("multi-partes");
       if (partes && partes.children.length === 0) {
-        adicionarPartePagamento(); // 1ª forma
-        adicionarPartePagamento(); // 2ª forma
+        adicionarPartePagamento();
+        adicionarPartePagamento();
       }
       atualizarRestanteMulti();
     }
-    return; // Não chama atualizarRestanteMulti de novo
+    return;
   }
 
   // Garante que o select volte a aparecer se não for Multipagamento
@@ -3100,46 +3242,69 @@ function verificarPagamento() {
 // ==========================================
 let _multiContador = 0;
 
+// Mapa de retrocompatibilidade: feature key antiga → usada para filtro de features
+const _PAG_FEAT_MAP_CLIENTE = {
+  Efetivo: "Efetivo",
+  TarjetaDebito: "Cartao",
+  TarjetaCredito: "Cartao",
+  TarjetaBRDebito: "CartaoBR",
+  TarjetaBRCredito: "CartaoBR",
+  Pix: "Pix",
+  Transferencia: "Transferencia",
+  Qr: "QrMaquina",
+};
+
 function _getMetodosPag() {
   const todos = tt({
     es: [
-      { value: "Efetivo", label: "💵 Efectivo" },
-      { value: "Cartao", label: "💳 Tarjeta" },
-      { value: "CartaoBR", label: "💳🇧🇷 Tarjeta BR" },
-      { value: "Pix", label: "🟢 Pix (BR)" },
-      { value: "Transferencia", label: "🏦 Alias/Transferencia" },
-      { value: "QrPy", label: "📱 QR Paraguay" },
+      { value: "Efetivo",         label: "💵 Efectivo" },
+      { value: "TarjetaDebito",   label: "💳 Tarjeta Débito" },
+      { value: "TarjetaCredito",  label: "💳 Tarjeta Crédito" },
+      { value: "TarjetaBRDebito", label: "💳🇧🇷 Tarjeta BR Débito" },
+      { value: "TarjetaBRCredito",label: "💳🇧🇷 Tarjeta BR Crédito" },
+      { value: "Pix",             label: "✅ Pix (BR)" },
+      { value: "Transferencia",   label: "🏦 Alias/Transferencia" },
+      { value: "Qr",              label: "📱 QR Paraguay" },
     ],
     pt: [
-      { value: "Efetivo", label: "💵 Dinheiro" },
-      { value: "Cartao", label: "💳 Cartão" },
-      { value: "CartaoBR", label: "💳🇧🇷 Cartão BR" },
-      { value: "Pix", label: "🟢 Pix (BR)" },
-      { value: "Transferencia", label: "🏦 Alias/Transferência" },
-      { value: "QrPy", label: "📱 QR Paraguai" },
+      { value: "Efetivo",         label: "💵 Dinheiro" },
+      { value: "TarjetaDebito",   label: "💳 Cartão Débito" },
+      { value: "TarjetaCredito",  label: "💳 Cartão Crédito" },
+      { value: "TarjetaBRDebito", label: "💳🇧🇷 Cartão BR Débito" },
+      { value: "TarjetaBRCredito",label: "💳🇧🇷 Cartão BR Crédito" },
+      { value: "Pix",             label: "✅ Pix (BR)" },
+      { value: "Transferencia",   label: "🏦 Alias/Transferência" },
+      { value: "Qr",              label: "📱 QR Paraguai" },
     ],
     en: [
-      { value: "Efetivo", label: "💵 Cash" },
-      { value: "Cartao", label: "💳 Card" },
-      { value: "CartaoBR", label: "💳🇧🇷 Card BR" },
-      { value: "Pix", label: "🟢 Pix (BR)" },
-      { value: "Transferencia", label: "🏦 Alias/Transfer" },
-      { value: "QrPy", label: "📱 QR Paraguay" },
+      { value: "Efetivo",         label: "💵 Cash" },
+      { value: "TarjetaDebito",   label: "💳 Card Debit" },
+      { value: "TarjetaCredito",  label: "💳 Card Credit" },
+      { value: "TarjetaBRDebito", label: "💳🇧🇷 Card BR Debit" },
+      { value: "TarjetaBRCredito",label: "💳🇧🇷 Card BR Credit" },
+      { value: "Pix",             label: "✅ Pix (BR)" },
+      { value: "Transferencia",   label: "🏦 Alias/Transfer" },
+      { value: "Qr",              label: "📱 QR Paraguay" },
     ],
     de: [
-      { value: "Efetivo", label: "💵 Bargeld" },
-      { value: "Cartao", label: "💳 Karte" },
-      { value: "CartaoBR", label: "💳🇧🇷 Karte BR" },
-      { value: "Pix", label: "🟢 Pix (BR)" },
-      { value: "Transferencia", label: "🏦 Alias/Überweisung" },
-      { value: "QrPy", label: "📱 QR Paraguay" },
+      { value: "Efetivo",         label: "💵 Bargeld" },
+      { value: "TarjetaDebito",   label: "💳 Karte Debit" },
+      { value: "TarjetaCredito",  label: "💳 Karte Kredit" },
+      { value: "TarjetaBRDebito", label: "💳🇧🇷 Karte BR Debit" },
+      { value: "TarjetaBRCredito",label: "💳🇧🇷 Karte BR Kredit" },
+      { value: "Pix",             label: "✅ Pix (BR)" },
+      { value: "Transferencia",   label: "🏦 Alias/Überweisung" },
+      { value: "Qr",              label: "📱 QR Paraguay" },
     ],
   });
-  // Não deixa escolher, no "Dividir Pagamento", uma forma que o adminMaster
-  // desativou globalmente em Configurações → Controle de Features.
+
   if (!FEATURES_PAGAMENTOS_CLIENTE) return todos;
-  return todos.filter((m) => FEATURES_PAGAMENTOS_CLIENTE[m.value] !== false);
+  return todos.filter((m) => {
+    const featKey = _PAG_FEAT_MAP_CLIENTE[m.value] || m.value;
+    return FEATURES_PAGAMENTOS_CLIENTE[featKey] !== false;
+  });
 }
+
 const METODOS_PAG = [
   { value: "Efetivo", label: "💵 Efectivo" },
   { value: "Cartao", label: "💳 Tarjeta" },
@@ -3500,12 +3665,36 @@ function _executarGetPosition(btn, msg, boxErro) {
         lat: position.coords.latitude,
         lng: position.coords.longitude,
       };
-      const dist = calcularDistancia(
+      
+      // MUDANÇA 1: Trocado de const para let
+      let dist = calcularDistancia(
         COORD_LOJA.lat,
         COORD_LOJA.lng,
         localCliente.lat,
         localCliente.lng,
       );
+
+      // MUDANÇA 2: Adicionada a Margem de Segurança (10% + 150m)
+      dist = (dist * 1.10) + 0.15;
+
+      // ── VERIFICAÇÃO DE ZONAS ESPECIAIS (Prioridade Máxima) ─────────────
+      const zona = (window.ZONAS_ESPECIAIS || []).find((z) => {
+        const distZona = calcularDistancia(z.lat, z.lng, localCliente.lat, localCliente.lng);
+        // MUDANÇA 3: Number() para garantir
+        return distZona <= Number(z.raio_km);
+      });
+
+      if (zona) {
+        freteCalculado = Number(zona.valor_cliente);
+        freteMotoboy = Number(zona.valor_motoboy);
+        msg.innerHTML = `<span style="color:#27ae60">✅ Zona Especial: ${zona.nome} → Env: Gs ${zona.valor_cliente.toLocaleString("es-PY")}</span>`;
+        msg.style.color = "#27ae60";
+        boxErro.style.display = "none";
+        btn.innerText = _gL.localizacaoOk;
+        btn.disabled = true;
+        atualizarTotalCheckout();
+        return; // Encerra aqui, não processa a tabela normal
+      }
 
       // === TABELA DE FRETE DINÂMICA (configurada no admin) ===
       // ATENÇÃO: deve ser IDÊNTICO ao index.ts (Edge Function) e admin.js calcularFretePDV
@@ -3569,9 +3758,7 @@ function _executarGetPosition(btn, msg, boxErro) {
       atualizarTotalCheckout();
     },
     (err) => {
-      // ⚠️ CORRIGIDO: antes disso só mostrava "marque a opção pra combinar
-      // pelo WhatsApp" e travava o pedido até o cliente fazer isso
-      // manualmente. Agora aplica automaticamente o frete mínimo da
+      // ⚠️ CORRIGIDO: aplica automaticamente o frete mínimo da
       // tabela (faixa de 0-1km) e deixa claro que pode aumentar depois.
       const freteMinimo = _obterFreteMinimoDaTabela();
       freteCalculado = freteMinimo;
@@ -3668,17 +3855,8 @@ async function enviarZap() {
     ? document.getElementById("cli-nasc").value
     : null;
 
-  // Resolve o nome final do método de pagamento (CartaoBR/Cartao têm sub-tipos)
-  const pagFinal =
-    pag === "CartaoBR"
-      ? _cartaoBRTipo === "debito"
-        ? tt({es:"Tarjeta BR - Débito",pt:"Cartão BR - Débito",en:"Card BR - Debit",de:"Karte BR - Debit"})
-        : tt({es:"Tarjeta BR - Crédito",pt:"Cartão BR - Crédito",en:"Card BR - Credit",de:"Karte BR - Kredit"})
-      : pag === "Cartao"
-        ? _cartaoPYTipo === "debito"
-          ? tt({es:"Tarjeta - Débito",pt:"Cartão - Débito",en:"Card - Debit",de:"Karte - Debit"})
-          : tt({es:"Tarjeta - Crédito",pt:"Cartão - Crédito",en:"Card - Credit",de:"Karte - Kredit"})
-        : pag;
+  // Novo: o código já carrega o tipo (Débito/Crédito)
+  const pagFinal = pag;
 
   if (!nome || !tel || !pag)
     return alert(tt({es:"¡Complete todos los campos obligatorios!",pt:"Preencha todos os campos obrigatórios!",en:"Fill in all required fields!",de:"Füllen Sie alle Pflichtfelder aus!"}));
@@ -3791,47 +3969,11 @@ async function enviarZap() {
   const totalGeral =
     totalItens - desconto + (modoEntrega === "delivery" ? freteAplicado : 0);
 
-  // Taxa de cartão (Cartao / CartaoBR) — a mesma lógica do PDV: se a taxa
-  // configurada for 0%, não soma nada; se houver taxa, soma no total real.
-  let _taxaCartaoValorCli = 0;
-  let _taxaCartaoPctCli = 0;
-  if (pag === "CartaoBR" && (TAXA_DEBITO_BR > 0 || TAXA_CREDITO_BR > 0)) {
-    _taxaCartaoPctCli = _cartaoBRTipo === "debito" ? TAXA_DEBITO_BR : TAXA_CREDITO_BR;
-    _taxaCartaoValorCli = Math.round(totalGeral * (_taxaCartaoPctCli / 100));
-  } else if (pag === "Cartao" && (TAXA_DEBITO_BR > 0 || TAXA_CREDITO_BR > 0)) {
-    _taxaCartaoPctCli = _cartaoPYTipo === "debito" ? TAXA_DEBITO_BR : TAXA_CREDITO_BR;
-    _taxaCartaoValorCli = Math.round(totalGeral * (_taxaCartaoPctCli / 100));
-  }
-  const totalComTaxaCartao = totalGeral + _taxaCartaoValorCli;
-
   // 1. Salva no Banco PRIMEIRO para pegar o ID real
   let pedidoDbId = null;
   let numeroPedido = null;
 
   if (typeof supa !== "undefined") {
-    const _itensComTaxa = carrinho.map((i) => ({
-      n: i.nome,
-      nome: i.nome, // alias legível para admin/motoboy
-      p: i.preco,
-      q: i.qtd,
-      qtd: i.qtd,
-      produto_id: i.produto_id || null,
-      t: i.variacao || "",
-      pr: i.preparo || "",
-      m: i.montagem,
-      o: i.obs,
-      categoria_slug: i.categoria_slug || i.cat || "",
-      es_bebida: i.es_bebida || false,
-    }));
-    if (_taxaCartaoValorCli > 0) {
-      _itensComTaxa.push({
-        n: `Taxa de Cartão (${_taxaCartaoPctCli}%)`,
-        nome: `Taxa de Cartão (${_taxaCartaoPctCli}%)`,
-        p: _taxaCartaoValorCli,
-        q: 1,
-        qtd: 1,
-      });
-    }
     const pedidoDb = {
       status: "pendente",
       tipo_entrega: modoEntrega,
@@ -3839,9 +3981,7 @@ async function enviarZap() {
       frete_cobrado_cliente: modoEntrega === "delivery" ? freteAplicado : 0,
       frete_motoboy: modoEntrega === "delivery" ? freteMotoboy : 0,
       desconto_cupom: desconto,
-      total_geral: totalComTaxaCartao,
-      taxa_cartao_percentual: _taxaCartaoValorCli > 0 ? _taxaCartaoPctCli : null,
-      taxa_cartao_valor: _taxaCartaoValorCli,
+      total_geral: totalGeral,
       forma_pagamento: pagFinal,
       obs_pagamento:
         pag === "Efetivo"
@@ -3849,7 +3989,20 @@ async function enviarZap() {
           : pag === "Multipagamento"
             ? JSON.stringify(_coletarMultiPagamento())
             : "",
-      itens: _itensComTaxa,
+      itens: carrinho.map((i) => ({
+        n: i.nome,
+        nome: i.nome, // alias legível para admin/motoboy
+        p: i.preco,
+        q: i.qtd,
+        qtd: i.qtd, // alias legível
+        produto_id: i.produto_id || null, // ID real — desconto de estoque
+        t: i.variacao || "",
+        pr: i.preparo || "",
+        m: i.montagem,
+        o: i.obs,
+        categoria_slug: i.categoria_slug || i.cat || "", // para filtro de bebidas no motoboy
+        es_bebida: i.es_bebida || false,
+      })),
       endereco_entrega: ref,
       geo_lat: localCliente ? localCliente.lat.toString() : null,
       geo_lng: localCliente ? localCliente.lng.toString() : null,
@@ -4090,10 +4243,7 @@ async function enviarZap() {
   if (modoEntrega === "delivery" && !usouPlanoB) {
     msg += `${_wl.envio}: Gs ${freteAplicado.toLocaleString("es-PY")}\n`;
   }
-  if (_taxaCartaoValorCli > 0) {
-    msg += `💳 Taxa de Cartão (${_taxaCartaoPctCli}%): +Gs ${_taxaCartaoValorCli.toLocaleString("es-PY")}\n`;
-  }
-  msg += `${_wl.total}: Gs ${totalComTaxaCartao.toLocaleString("es-PY")}\n`;
+  msg += `${_wl.total}: Gs ${totalGeral.toLocaleString("es-PY")}\n`;
   msg += `--------------------------\n`;
 
   // Pagamento e Troco
@@ -4114,16 +4264,14 @@ async function enviarZap() {
   }
 
   // Avisos de Pix/Alias
-  if (pag === "Pix" || pag === "Transferencia" || pag === "QrPy") {
+    if (pag === "Pix" || pag === "Transferencia" || pag === "Qr") {
     if (pag === "Pix") {
-      const totalBrl =
-        COTACAO_REAL > 0 ? (totalComTaxaCartao / COTACAO_REAL).toFixed(2) : "---";
+      const totalBrl = COTACAO_REAL > 0 ? (totalGeral / COTACAO_REAL).toFixed(2) : "---";
       msg += `\n💠 ${_wl.pixChave}: ${CHAVE_PIX}\n`;
       msg += `💰 ${_wl.pixValorReais}: R$ ${totalBrl}\n`;
     }
     if (pag === "Transferencia") msg += `\n📎 ${_wl.aliasLabel}: ${ALIAS_PY}\n`;
-    if (pag === "QrPy")
-      msg += `\n📱 ${_wl.pagoPorQr}\n`;
+    if (pag === "Qr") msg += `\n📱 ${_wl.pagoPorQr}\n`;
     msg += `\n⚠️ *${_wl.envieComprovante}*\n`;
   }
 
@@ -4139,7 +4287,7 @@ async function enviarZap() {
       if (p.metodo === "Transferencia") {
         msg += `\n📎 ${_wl.aliasLabel} (${_wl.formaN} ${idx + 1}): ${ALIAS_PY}\n`;
       }
-      if (p.metodo === "QrPy") {
+      if (p.metodo === "Qr") {
         msg += `\n📱 QR Paraguay (${_wl.formaN} ${idx + 1}): Tigo / Personal / Bancard\n`;
       }
     });
@@ -4147,7 +4295,7 @@ async function enviarZap() {
       (p) =>
         p.metodo === "Pix" ||
         p.metodo === "Transferencia" ||
-        p.metodo === "QrPy",
+        p.metodo === "Qr",
     );
     if (temDigital)
       msg += `\n⚠️ *${_wl.envieComprovantes}*\n`;
@@ -4283,9 +4431,23 @@ function _menuContemProduto(item) {
       (item.produto_id && p.id === item.produto_id) ||
       (p.nome || "").toLowerCase() === (item.nome || "").toLowerCase()
     );
-    if (found) return true;
+    
+    if (found) {
+      // Verifica se a variação (ex: Coca-Cola Zero) ainda existe e está ativa
+      let cfg = found.montagem;
+      if (typeof cfg === "string") {
+        try { cfg = JSON.parse(cfg); } catch (_) { cfg = null; }
+      }
+      
+      if (item.variacao && cfg && cfg.__tipo === "variacoes" && Array.isArray(cfg.variacoes)) {
+        const vAtiva = cfg.variacoes.find(v => v.nome === item.variacao && v.ativo !== false);
+        if (!vAtiva) return false; // A variação foi pausada/deletada
+      }
+      
+      return true; // Produto e variação válidos
+    }
   }
-  return false;
+  return false; // Produto não existe mais no menu ou está pausado/sem estoque
 }
 
 // Chamada APÓS renderMenu() para enriquecer o box com disponibilidade real
@@ -4372,13 +4534,23 @@ function repetirPedido() {
   })();
   if (!last || !Array.isArray(last) || last.length === 0) return;
 
+  // Filtra apenas o que ainda está no menu e disponível
   const disponiveis   = last.filter(i => _menuContemProduto(i));
   const indisponiveis = last.length - disponiveis.length;
 
   if (disponiveis.length === 0) {
-    mostrarToast(tt({es:"Ningún ítem del pedido anterior está disponible en el menú actual.",pt:"Nenhum item do pedido anterior está disponível no menu atual.",en:"No items from the previous order are available in the current menu.",de:"Keine Artikel der vorherigen Bestellung sind im aktuellen Menü verfügbar."}), "warning", 4000);
+    mostrarToast(
+      tt({
+        es: "Ningún ítem del pedido anterior está disponible en el menú actual.",
+        pt: "Nenhum item do pedido anterior está disponível no menu atual.",
+        en: "No items from the previous order are available in the current menu.",
+        de: "Keine Artikel der vorherigen Bestellung sind im aktuellen Menü verfügbar."
+      }),
+      "warning", 4000
+    );
     return;
   }
+
   if (indisponiveis > 0) {
     mostrarToast(
       tt({
@@ -5381,3 +5553,4 @@ setInterval(salvarCarrinhoLocal, 5000); // A cada 5 segundos
 setTimeout(restaurarCarrinhoBackup, 1000);
 
 // ==========================================
+
